@@ -1588,42 +1588,82 @@ async def add_message_id(
 
     data = await state.get_data()
 
+    await state.update_data(message_id=message_id)
+    data = await state.get_data()
+    await finish_add(message, state, data, fast=False)
+
+
+# =========================================================
+# FAST ADD: CHANNEL MESSAGE REPLY + /add
+# =========================================================
+
+async def save_movie_to_supabase(movie_data: Dict) -> tuple[bool, str]:
+    """Kinoni Supabase'ga xavfsiz saqlaydi va aniq xatoni qaytaradi."""
+    try:
+        sb = get_supabase()
+        result = sb.table("movies").insert(movie_data).execute()
+        if not result.data:
+            return False, "Supabase insert javobida ma'lumot qaytmadi."
+        return True, ""
+    except Exception as e:
+        logger.exception("movie insert error")
+        return False, str(e)
+
+
+async def finish_add(message: Message, state: FSMContext, data: Dict, *, fast: bool = False):
+    """FSM'dagi ma'lumotlarni tekshiradi va kinoni bitta joydan saqlaydi."""
+    required = ("code", "title", "genre", "channel_id", "message_id")
+    missing = [key for key in required if data.get(key) in (None, "")]
+    if missing:
+        await message.answer(
+            "❌ Ma'lumot yetishmayapti: " + ", ".join(missing) +
+            ". /add jarayonini qaytadan boshlang."
+        )
+        await state.clear()
+        return
+
     movie_data = {
-        "code": data["code"],
-        "title": data["title"],
+        "code": str(data["code"]).strip(),
+        "title": str(data["title"]).strip(),
         "alternative_title": data.get("alternative_title"),
         "description": data.get("description"),
         "year": data.get("year"),
-        "genre": data.get("genre"),
+        "genre": str(data["genre"]).strip(),
         "rating": data.get("rating"),
-        "channel_id": data["channel_id"],
-        "message_id": message_id,
+        "channel_id": int(data["channel_id"]),
+        "message_id": int(data["message_id"]),
         "views": 0,
     }
 
-    try:
-        get_supabase().table("movies").insert(movie_data).execute()
-
-        await state.clear()
-
+    if await get_movie_by_code(movie_data["code"]):
         await message.answer(
-            "✅ <b>Kino bazaga qo‘shildi!</b>\n\n"
-            f"🔢 Kod: <code>{data['code']}</code>\n"
-            f"🎬 Nomi: {data['title']}\n"
-            f"📢 Kanal: <code>{data['channel_id']}</code>\n"
-            f"💬 Message ID: <code>{message_id}</code>",
-            reply_markup=main_menu_kb(),
+            f"❌ <b>{movie_data['code']}</b> kodi allaqachon mavjud.\n"
+            "Boshqa kod kiriting."
         )
+        return
 
-    except Exception as e:
-        logger.error(f"insert movie error: {e}")
-
+    ok, error = await save_movie_to_supabase(movie_data)
+    if not ok:
         await message.answer(
-            "❌ Kino qo‘shishda xatolik.\n"
-            "Kod takrorlangan bo‘lishi yoki Supabase "
-            "jadvalida muammo bo‘lishi mumkin.",
-            reply_markup=main_menu_kb(),
+            "❌ <b>Kino bazaga qo‘shilmadi.</b>\n\n"
+            "Supabase xatosi:\n"
+            f"<code>{error[:3000]}</code>\n\n"
+            "Tekshiring: movies jadvalidagi ustun nomlari, RLS/policy va SUPABASE_KEY."
         )
+        return
+
+    await state.clear()
+
+    prefix = "tez " if fast else ""
+    await message.answer(
+        f"✅ <b>Kino {prefix}qo‘shildi!</b>\n\n"
+        f"🔢 Kod: <code>{movie_data['code']}</code>\n"
+        f"🎬 {movie_data['title']}\n"
+        f"🎭 Janr: {movie_data['genre']}\n"
+        f"📢 Kanal: <code>{movie_data['channel_id']}</code>\n"
+        f"💬 Message ID: <code>{movie_data['message_id']}</code>",
+        reply_markup=main_menu_kb(),
+    )
 
 
 # =========================================================
@@ -1631,26 +1671,34 @@ async def add_message_id(
 # =========================================================
 
 @router.message(Command("add"))
-async def fast_add_start(
-    message: Message,
-    state: FSMContext,
-):
+async def fast_add_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
 
-    if not message.reply_to_message:
+    # Har bir yangi /add eski FSM jarayonini tozalaydi.
+    await state.clear()
+
+    replied = message.reply_to_message
+    if replied is None:
         await message.answer(
-            "📌 Kanal xabariga reply qilib /add yuboring."
+            "📌 Avval kanaldagi kino xabariga <b>Reply</b> qiling, "
+            "keyin shu reply ustiga <code>/add</code> yuboring."
         )
         return
 
-    replied = message.reply_to_message
+    # /add qaysi xabarga reply qilingan bo‘lsa, aynan o‘sha
+    # Telegram chat_id + message_id bazaga yoziladi.
+    channel_id = replied.chat.id
+    message_id = replied.message_id
+
+    if not channel_id or not message_id:
+        await message.answer("❌ Reply qilingan xabar ma'lumotlari topilmadi.")
+        return
 
     await state.update_data(
-        channel_id=replied.chat.id,
-        message_id=replied.message_id,
+        channel_id=channel_id,
+        message_id=message_id,
     )
-
     await state.set_state(FastAddMovie.code)
 
     await message.answer(
@@ -1660,214 +1708,114 @@ async def fast_add_start(
 
 
 @router.message(FastAddMovie.code)
-async def fast_code(
-    message: Message,
-    state: FSMContext,
-):
+async def fast_code(message: Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
 
     code = (message.text or "").strip()
-
+    if not code:
+        await message.answer("❌ Kod bo‘sh bo‘lmasin.")
+        return
+    if len(code) > 100:
+        await message.answer("❌ Kod juda uzun.")
+        return
     if await get_movie_by_code(code):
-        await message.answer(
-            "❌ Bu kod allaqachon mavjud."
-        )
+        await message.answer("❌ Bu kod allaqachon mavjud. Boshqa kod yuboring.")
         return
 
     await state.update_data(code=code)
     await state.set_state(FastAddMovie.title)
-
-    await message.answer(
-        "2️⃣ Kino nomini yuboring:"
-    )
+    await message.answer("2️⃣ Kino nomini yuboring:")
 
 
 @router.message(FastAddMovie.title)
-async def fast_title(
-    message: Message,
-    state: FSMContext,
-):
+async def fast_title(message: Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
-
-    await state.update_data(
-        title=(message.text or "").strip()
-    )
-
-    await state.set_state(
-        FastAddMovie.description
-    )
-
-    await message.answer(
-        "3️⃣ Tavsif yoki -:"
-    )
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("❌ Kino nomi bo‘sh bo‘lmasin.")
+        return
+    await state.update_data(title=title)
+    await state.set_state(FastAddMovie.description)
+    await message.answer("3️⃣ Tavsif yoki -:")
 
 
 @router.message(FastAddMovie.description)
-async def fast_desc(
-    message: Message,
-    state: FSMContext,
-):
+async def fast_desc(message: Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
-
     value = (message.text or "").strip()
-
-    if value == "-":
-        value = None
-
-    await state.update_data(description=value)
+    await state.update_data(description=None if value == "-" else value)
     await state.set_state(FastAddMovie.year)
-
-    await message.answer(
-        "4️⃣ Yil yoki -:"
-    )
+    await message.answer("4️⃣ Yil yoki -:")
 
 
 @router.message(FastAddMovie.year)
-async def fast_year(
-    message: Message,
-    state: FSMContext,
-):
+async def fast_year(message: Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
-
     value = (message.text or "").strip()
     year = None
-
     if value != "-":
         try:
             year = int(value)
         except ValueError:
-            await message.answer(
-                "❌ Yil noto‘g‘ri."
-            )
+            await message.answer("❌ Yil faqat raqam bo‘lishi kerak.")
             return
-
+        if year < 1800 or year > datetime.now().year + 2:
+            await message.answer("❌ Yil noto‘g‘ri. Masalan: 2026")
+            return
     await state.update_data(year=year)
     await state.set_state(FastAddMovie.genre)
-
-    await message.answer(
-        "5️⃣ Janr:"
-    )
+    await message.answer("5️⃣ Janr:")
 
 
 @router.message(FastAddMovie.genre)
-async def fast_genre(
-    message: Message,
-    state: FSMContext,
-):
+async def fast_genre(message: Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
-
-    await state.update_data(
-        genre=(message.text or "").strip()
-    )
-
-    await state.set_state(
-        FastAddMovie.rating
-    )
-
-    await message.answer(
-        "6️⃣ Reyting yoki -:"
-    )
+    genre = (message.text or "").strip()
+    if not genre:
+        await message.answer("❌ Janr bo‘sh bo‘lmasin.")
+        return
+    await state.update_data(genre=genre)
+    await state.set_state(FastAddMovie.rating)
+    await message.answer("6️⃣ Reyting yoki -:")
 
 
 @router.message(FastAddMovie.rating)
-async def fast_rating(
-    message: Message,
-    state: FSMContext,
-):
+async def fast_rating(message: Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
 
     value = (message.text or "").strip()
     rating = None
-
     if value != "-":
         try:
-            rating = float(
-                value.replace(",", ".")
-            )
+            rating = float(value.replace(",", "."))
         except ValueError:
-            await message.answer(
-                "❌ Reyting noto‘g‘ri."
-            )
+            await message.answer("❌ Reyting noto‘g‘ri. Masalan: 8.5")
+            return
+        if rating < 0 or rating > 10:
+            await message.answer("❌ Reyting 0 dan 10 gacha bo‘lishi kerak.")
             return
 
+    await state.update_data(rating=rating)
     data = await state.get_data()
-
-    movie_data = {
-        "code": data["code"],
-        "title": data["title"],
-        "alternative_title": None,
-        "description": data.get("description"),
-        "year": data.get("year"),
-        "genre": data.get("genre"),
-        "rating": rating,
-        "channel_id": data["channel_id"],
-        "message_id": data["message_id"],
-        "views": 0,
-    }
-
-    try:
-        get_supabase().table("movies").insert(movie_data).execute()
-
-        await state.clear()
-
-        await message.answer(
-            "✅ <b>Kino tez qo‘shildi!</b>\n\n"
-            f"🔢 Kod: <code>{data['code']}</code>\n"
-            f"🎬 {data['title']}\n"
-            f"📢 Kanal: <code>{data['channel_id']}</code>\n"
-            f"💬 Message ID: <code>{data['message_id']}</code>",
-            reply_markup=main_menu_kb(),
-        )
-
-    except Exception as e:
-        logger.error(f"fast add error: {e}")
-
-        await message.answer(
-            "❌ Kino qo‘shishda xatolik.",
-            reply_markup=main_menu_kb(),
-        )
+    await finish_add(message, state, data, fast=True)
 
 
 # =========================================================
