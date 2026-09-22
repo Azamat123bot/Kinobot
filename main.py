@@ -1,51 +1,59 @@
+"""
+Kino Bot — Professional (aiogram 3 + Supabase)
+FSM tuzatilgan, xatolar yopilgan, barqaror ishlaydi.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from html import escape
+from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import Client, create_client
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.filters import Command
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
     KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
 )
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-
 
 # =========================================================
-# CONFIGURATION (.env)
+# CONFIG
 # =========================================================
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-ADMIN_IDS = [
+ADMIN_IDS: List[int] = [
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 ]
-
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1001234567890"))
-
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@username").strip()
-
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-
 
 # =========================================================
 # LOGGING
@@ -53,11 +61,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
-
-logger = logging.getLogger(__name__)
-
+logger = logging.getLogger("kino_bot")
 
 # =========================================================
 # SUPABASE
@@ -132,9 +138,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="🆕 Yangi kinolar"),
                 KeyboardButton(text="❤️ Sevimlilar"),
             ],
-            [
-                KeyboardButton(text="ℹ️ Yordam"),
-            ],
+            [KeyboardButton(text="ℹ️ Yordam")],
         ],
         resize_keyboard=True,
     )
@@ -164,52 +168,28 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 
 
 def movie_actions_kb(movie_id: int, is_fav: bool = False) -> InlineKeyboardMarkup:
-    fav_button = InlineKeyboardButton(
-        text="💔 Sevimlilardan olib tashlash" if is_fav else "❤️ Sevimlilarga qo‘shish",
-        callback_data=f"unfav_{movie_id}" if is_fav else f"fav_{movie_id}",
-    )
-
+    fav_text = "💔 Sevimlilardan olib tashlash" if is_fav else "❤️ Sevimlilarga qo‘shish"
+    fav_data = f"unfav_{movie_id}" if is_fav else f"fav_{movie_id}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="▶️ Kinoni ko‘rish",
-                    callback_data=f"watch_{movie_id}",
-                )
-            ],
-            [fav_button],
-            [
-                InlineKeyboardButton(
-                    text="🔙 Orqaga",
-                    callback_data="back_main",
-                )
-            ],
+            [InlineKeyboardButton(text="▶️ Kinoni ko‘rish", callback_data=f"watch_{movie_id}")],
+            [InlineKeyboardButton(text=fav_text, callback_data=fav_data)],
+            [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")],
         ]
     )
 
 
 def force_sub_kb() -> InlineKeyboardMarkup:
-    channel = str(CHANNEL_ID)
-
-    if channel.startswith("-100"):
-        channel_link = f"https://t.me/c/{channel[4:]}"
+    if CHANNEL_USERNAME:
+        link = f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
+    elif str(CHANNEL_ID).startswith("-100"):
+        link = f"https://t.me/c/{str(CHANNEL_ID)[4:]}"
     else:
-        channel_link = "https://t.me/"
-
+        link = "https://t.me/"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📢 Kanalga obuna bo‘lish",
-                    url=channel_link,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✅ Tekshirish",
-                    callback_data="check_sub",
-                )
-            ],
+            [InlineKeyboardButton(text="📢 Kanalga obuna bo‘lish", url=link)],
+            [InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")],
         ]
     )
 
@@ -218,47 +198,24 @@ def confirm_delete_kb(movie_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="✅ Ha",
-                    callback_data=f"del_yes_{movie_id}",
-                ),
-                InlineKeyboardButton(
-                    text="❌ Yo‘q",
-                    callback_data="del_no",
-                ),
+                InlineKeyboardButton(text="✅ Ha", callback_data=f"del_yes_{movie_id}"),
+                InlineKeyboardButton(text="❌ Yo‘q", callback_data="del_no"),
             ]
         ]
     )
 
 
 def genres_kb(genres: List[str]) -> InlineKeyboardMarkup:
-    buttons = []
-    row = []
-
-    for genre in genres:
-        row.append(
-            InlineKeyboardButton(
-                text=genre,
-                callback_data=f"genre_{genre}",
-            )
-        )
-
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for g in genres:
+        row.append(InlineKeyboardButton(text=g, callback_data=f"genre_{g}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
-
     if row:
         buttons.append(row)
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🔙 Orqaga",
-                callback_data="back_main",
-            )
-        ]
-    )
-
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -274,69 +231,69 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def register_user(message: Message):
+def safe_html(text: Any) -> str:
+    if text is None:
+        return ""
+    return escape(str(text))
+
+
+def sanitize_query(q: str) -> str:
+    return re.sub(r"[%_\\]", "", (q or "").strip())[:100]
+
+
+async def register_user(message: Message) -> None:
     user = message.from_user
+    if not user:
+        return
     sb = get_supabase()
-
-    data = {
-        "telegram_id": user.id,
-        "username": user.username,
-        "first_name": user.first_name,
-        "last_activity": now_iso(),
-        "is_blocked": False,
-    }
-
     try:
-        result = (
+        existing = (
             sb.table("users")
             .select("id")
             .eq("telegram_id", user.id)
             .limit(1)
             .execute()
         )
-
-        if result.data:
-            (
-                sb.table("users")
-                .update(
-                    {
-                        "username": user.username,
-                        "first_name": user.first_name,
-                        "last_activity": now_iso(),
-                        "is_blocked": False,
-                    }
-                )
-                .eq("telegram_id", user.id)
-                .execute()
-            )
+        if existing.data:
+            sb.table("users").update(
+                {
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_activity": now_iso(),
+                    "is_blocked": False,
+                }
+            ).eq("telegram_id", user.id).execute()
         else:
-            sb.table("users").insert(data).execute()
-
+            sb.table("users").insert(
+                {
+                    "telegram_id": user.id,
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_activity": now_iso(),
+                    "is_blocked": False,
+                }
+            ).execute()
     except Exception as e:
-        logger.error(f"register_user error: {e}")
+        logger.error("register_user: %s", e)
 
 
 async def check_subscription(bot: Bot, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
-
         return member.status in (
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.RESTRICTED,
         )
-
     except Exception as e:
-        logger.warning(f"Subscription check failed for {user_id}: {e}")
-
-        # Bot kanalni tekshira olmasa foydalanuvchini bloklab qo‘ymaslik.
+        logger.warning("sub check %s: %s", user_id, e)
         return True
 
 
 async def get_movie_by_code(code: str) -> Optional[Dict]:
     try:
-        result = (
+        r = (
             get_supabase()
             .table("movies")
             .select("*")
@@ -344,17 +301,15 @@ async def get_movie_by_code(code: str) -> Optional[Dict]:
             .limit(1)
             .execute()
         )
-
-        return result.data[0] if result.data else None
-
+        return r.data[0] if r.data else None
     except Exception as e:
-        logger.error(f"get_movie_by_code error: {e}")
+        logger.error("get_movie_by_code: %s", e)
         return None
 
 
 async def get_movie_by_id(movie_id: int) -> Optional[Dict]:
     try:
-        result = (
+        r = (
             get_supabase()
             .table("movies")
             .select("*")
@@ -362,30 +317,22 @@ async def get_movie_by_id(movie_id: int) -> Optional[Dict]:
             .limit(1)
             .execute()
         )
-
-        return result.data[0] if result.data else None
-
+        return r.data[0] if r.data else None
     except Exception as e:
-        logger.error(f"get_movie_by_id error: {e}")
+        logger.error("get_movie_by_id: %s", e)
         return None
 
 
-async def increment_views(movie_id: int):
+async def increment_views(movie_id: int) -> None:
     try:
-        # Supabase'dagi RPC funksiyasi:
-        # increment_movie_views(movie_id bigint/integer)
-        get_supabase().rpc(
-            "increment_movie_views",
-            {"movie_id": movie_id},
-        ).execute()
-
+        get_supabase().rpc("increment_movie_views", {"movie_id": movie_id}).execute()
     except Exception as e:
-        logger.error(f"increment_views error: {e}")
+        logger.error("increment_views: %s", e)
 
 
 async def is_favorite(telegram_id: int, movie_id: int) -> bool:
     try:
-        result = (
+        r = (
             get_supabase()
             .table("favorites")
             .select("id")
@@ -394,1230 +341,69 @@ async def is_favorite(telegram_id: int, movie_id: int) -> bool:
             .limit(1)
             .execute()
         )
-
-        return bool(result.data)
-
+        return bool(r.data)
     except Exception as e:
-        logger.error(f"is_favorite error: {e}")
+        logger.error("is_favorite: %s", e)
         return False
 
 
 def format_movie_card(movie: Dict) -> str:
-    title = movie.get("title") or "Noma'lum"
+    title = safe_html(movie.get("title") or "Noma'lum")
     alt = movie.get("alternative_title")
     year = movie.get("year") or "—"
-    genre = movie.get("genre") or "—"
+    genre = safe_html(movie.get("genre") or "—")
     rating = movie.get("rating")
     views = movie.get("views") or 0
     desc = movie.get("description") or ""
-
     rating_text = rating if rating is not None else "—"
 
     text = f"🎬 <b>{title}</b>"
-
     if alt:
-        text += f"\n📌 {alt}"
-
-    text += (
-        f"\n\n📅 {year}"
-        f"\n🎭 {genre}"
-        f"\n⭐ {rating_text}"
-        f"\n👀 {views:,}"
-    )
-
+        text += f"\n📌 {safe_html(alt)}"
+    text += f"\n\n📅 {year}\n🎭 {genre}\n⭐ {rating_text}\n👀 {views:,}"
     if desc:
-        text += f"\n\n📝 {desc}"
-
+        text += f"\n\n📝 {safe_html(desc)}"
     return text
 
 
-async def ensure_default_genres():
-    """Birinchi botdagi default janrlarni Supabase genres jadvaliga qo‘shadi."""
-    default_genres = [
-        "Action",
-        "Comedy",
-        "Horror",
-        "Romance",
-        "Sci-Fi",
-        "Fantasy",
-        "Drama",
-        "Thriller",
-        "Family",
-        "Animation",
+async def ensure_default_genres() -> None:
+    defaults = [
+        "Action", "Comedy", "Horror", "Romance", "Sci-Fi",
+        "Fantasy", "Drama", "Thriller", "Family", "Animation",
     ]
-
     sb = get_supabase()
-
-    for genre in default_genres:
+    for g in defaults:
         try:
-            existing = (
-                sb.table("genres")
-                .select("id")
-                .eq("name", genre)
-                .limit(1)
-                .execute()
-            )
-
-            if not existing.data:
-                sb.table("genres").insert({"name": genre}).execute()
-
+            ex = sb.table("genres").select("id").eq("name", g).limit(1).execute()
+            if not ex.data:
+                sb.table("genres").insert({"name": g}).execute()
         except Exception as e:
-            logger.warning(f"Default genre '{genre}' error: {e}")
+            logger.warning("genre %s: %s", g, e)
 
 
-# =========================================================
-# ROUTER
-# =========================================================
-
-router = Router()
-
-
-# =========================================================
-# START / HELP
-# =========================================================
-
-@router.message(Command("start"))
-async def cmd_start(message: Message, bot: Bot, state: FSMContext):
-    await state.clear()
-    await register_user(message)
-
-    if not await check_subscription(bot, message.from_user.id):
-        await message.answer(
-            "📢 Botdan foydalanish uchun kanalimizga obuna bo‘ling.\n\n"
-            "Obuna bo‘lgandan keyin «✅ Tekshirish» tugmasini bosing.",
-            reply_markup=force_sub_kb(),
-        )
-        return
-
-    await message.answer(
-        "🎬 <b>Kino Bot</b>\n\n"
-        "Kerakli kinoni kod yoki nom orqali tez toping.",
-        reply_markup=main_menu_kb(),
-    )
-
-
-@router.message(Command("help"))
-@router.message(F.text == "ℹ️ Yordam")
-async def cmd_help(message: Message):
-    await register_user(message)
-
-    text = (
-        "ℹ️ <b>Yordam</b>\n\n"
-        "🔢 <b>Kod orqali</b> — kino kodini yuboring\n"
-        "🔎 <b>Nom orqali</b> — kino nomini yozing\n"
-        "🎭 <b>Janr</b> — janr bo‘yicha qidirish\n"
-        "🔥 <b>Mashhur</b> — eng ko‘p ko‘rilganlar\n"
-        "❤️ <b>Sevimlilar</b> — tanlangan kinolar\n\n"
-        f"💬 Savollar: {SUPPORT_USERNAME}"
-    )
-
-    await message.answer(
-        text,
-        reply_markup=main_menu_kb(),
-    )
-
-
-# =========================================================
-# SUBSCRIPTION
-# =========================================================
-
-@router.callback_query(F.data == "check_sub")
-async def check_sub_callback(callback: CallbackQuery, bot: Bot):
-    if await check_subscription(bot, callback.from_user.id):
-        try:
-            await callback.message.edit_text("✅ Obuna tasdiqlandi!")
-        except Exception:
-            pass
-
-        await callback.message.answer(
-            "🎬 <b>Kino Bot</b>\n\n"
-            "Kerakli kinoni kod yoki nom orqali tez toping.",
-            reply_markup=main_menu_kb(),
-        )
-
-        await callback.answer()
-
-    else:
-        await callback.answer(
-            "❌ Siz hali kanalga obuna bo‘lmagansiz.",
-            show_alert=True,
-        )
-
-
-# =========================================================
-# BACK
-# =========================================================
-
-@router.callback_query(F.data == "back_main")
-async def back_main(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-
-    await callback.message.answer(
-        "🎬 Asosiy menyu",
-        reply_markup=main_menu_kb(),
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# SEARCH BY CODE
-# =========================================================
-
-@router.message(F.text == "🔢 Kod orqali qidirish")
-async def search_by_code_start(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-):
-    await register_user(message)
-
-    if not await check_subscription(bot, message.from_user.id):
-        await message.answer(
-            "📢 Kanalga obuna bo‘ling.",
-            reply_markup=force_sub_kb(),
-        )
-        return
-
-    await state.set_state(SearchCode.waiting)
-
-    await message.answer(
-        "🔢 Kino kodini yuboring:",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(SearchCode.waiting)
-async def search_by_code_process(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    code = (message.text or "").strip()
-
-    movie = await get_movie_by_code(code)
-
-    if not movie:
-        await message.answer(
-            "❌ Kino topilmadi.\n"
-            "Boshqa kod yuboring."
-        )
-        return
-
-    await state.clear()
-
-    favorite = await is_favorite(
-        message.from_user.id,
-        movie["id"],
-    )
-
-    await message.answer(
-        format_movie_card(movie),
-        reply_markup=movie_actions_kb(
-            movie["id"],
-            favorite,
-        ),
-    )
-
-
-# =========================================================
-# SEARCH BY TITLE
-# =========================================================
-
-@router.message(F.text == "🎬 Kino qidirish")
-async def search_by_title_start(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-):
-    await register_user(message)
-
-    if not await check_subscription(bot, message.from_user.id):
-        await message.answer(
-            "📢 Kanalga obuna bo‘ling.",
-            reply_markup=force_sub_kb(),
-        )
-        return
-
-    await state.set_state(SearchTitle.waiting)
-
-    await message.answer(
-        "🎬 Kino nomini yozing:",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(SearchTitle.waiting)
-async def search_by_title_process(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    query = (message.text or "").strip()
-
+async def save_movie(movie_data: Dict) -> tuple[bool, str]:
     try:
-        result = (
-            get_supabase()
-            .table("movies")
-            .select("*")
-            .or_(
-                f"title.ilike.%{query}%,"
-                f"alternative_title.ilike.%{query}%"
-            )
-            .order("views", desc=True)
-            .limit(20)
-            .execute()
-        )
-
-        rows = result.data or []
-
-    except Exception as e:
-        logger.error(f"title search error: {e}")
-        await message.answer("❌ Qidirishda xatolik.")
-        return
-
-    if not rows:
-        await message.answer(
-            "❌ Hech narsa topilmadi.\n"
-            "Boshqa nom yuboring."
-        )
-        return
-
-    await state.clear()
-
-    if len(rows) == 1:
-        movie = rows[0]
-
-        favorite = await is_favorite(
-            message.from_user.id,
-            movie["id"],
-        )
-
-        await message.answer(
-            format_movie_card(movie),
-            reply_markup=movie_actions_kb(
-                movie["id"],
-                favorite,
-            ),
-        )
-        return
-
-    text = "🔍 <b>Topilgan kinolar:</b>\n\n"
-    buttons = []
-
-    for row in rows:
-        text += (
-            f"🎬 {row['title']} "
-            f"({row.get('year') or '—'})\n"
-        )
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=row["title"][:30],
-                    callback_data=f"movie_{row['id']}",
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🔙 Orqaga",
-                callback_data="back_main",
-            )
-        ]
-    )
-
-    await message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
-    )
-
-
-# =========================================================
-# SHOW MOVIE
-# =========================================================
-
-@router.callback_query(F.data.startswith("movie_"))
-async def show_movie_callback(callback: CallbackQuery):
-    try:
-        movie_id = int(callback.data.split("_", 1)[1])
-    except (ValueError, IndexError):
-        await callback.answer("Noto‘g‘ri kino ID.", show_alert=True)
-        return
-
-    movie = await get_movie_by_id(movie_id)
-
-    if not movie:
-        await callback.answer(
-            "Kino topilmadi.",
-            show_alert=True,
-        )
-        return
-
-    favorite = await is_favorite(
-        callback.from_user.id,
-        movie_id,
-    )
-
-    await callback.message.answer(
-        format_movie_card(movie),
-        reply_markup=movie_actions_kb(
-            movie_id,
-            favorite,
-        ),
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# WATCH MOVIE
-# =========================================================
-
-@router.callback_query(F.data.startswith("watch_"))
-async def watch_movie(
-    callback: CallbackQuery,
-    bot: Bot,
-):
-    try:
-        movie_id = int(callback.data.split("_", 1)[1])
-    except (ValueError, IndexError):
-        await callback.answer(
-            "Noto‘g‘ri kino ID.",
-            show_alert=True,
-        )
-        return
-
-    movie = await get_movie_by_id(movie_id)
-
-    if not movie:
-        await callback.answer(
-            "Kino topilmadi.",
-            show_alert=True,
-        )
-        return
-
-    try:
-        await bot.copy_message(
-            chat_id=callback.from_user.id,
-            from_chat_id=movie["channel_id"],
-            message_id=movie["message_id"],
-        )
-
-        await increment_views(movie_id)
-
-        await callback.answer("🎬 Kino yuborildi ✅")
-
-    except TelegramForbiddenError:
-        await callback.answer(
-            "❌ Botni bloklagansiz.",
-            show_alert=True,
-        )
-
-    except TelegramBadRequest as e:
-        logger.error(f"copy_message error: {e}")
-
-        await callback.answer(
-            "❌ Kino xabari topilmadi yoki o‘chirilgan.",
-            show_alert=True,
-        )
-
-    except Exception as e:
-        logger.error(f"watch error: {e}")
-
-        await callback.answer(
-            "❌ Xatolik yuz berdi.",
-            show_alert=True,
-        )
-
-
-# =========================================================
-# FAVORITES
-# =========================================================
-
-@router.callback_query(F.data.startswith("fav_"))
-async def add_favorite(callback: CallbackQuery):
-    try:
-        movie_id = int(callback.data.split("_", 1)[1])
-
-        (
-            get_supabase()
-            .table("favorites")
-            .upsert(
-                {
-                    "telegram_id": callback.from_user.id,
-                    "movie_id": movie_id,
-                },
-                on_conflict="telegram_id,movie_id",
-            )
-            .execute()
-        )
-
-        await callback.answer("❤️ Sevimlilarga qo‘shildi")
-
-        await callback.message.edit_reply_markup(
-            reply_markup=movie_actions_kb(
-                movie_id,
-                True,
-            )
-        )
-
-    except Exception as e:
-        logger.error(f"favorite error: {e}")
-
-        await callback.answer(
-            "❌ Xatolik.",
-            show_alert=True,
-        )
-
-
-@router.callback_query(F.data.startswith("unfav_"))
-async def remove_favorite(callback: CallbackQuery):
-    try:
-        movie_id = int(callback.data.split("_", 1)[1])
-
-        (
-            get_supabase()
-            .table("favorites")
-            .delete()
-            .eq("telegram_id", callback.from_user.id)
-            .eq("movie_id", movie_id)
-            .execute()
-        )
-
-        await callback.answer("💔 Olib tashlandi")
-
-        await callback.message.edit_reply_markup(
-            reply_markup=movie_actions_kb(
-                movie_id,
-                False,
-            )
-        )
-
-    except Exception as e:
-        logger.error(f"unfavorite error: {e}")
-
-        await callback.answer(
-            "❌ Xatolik.",
-            show_alert=True,
-        )
-
-
-@router.message(F.text == "❤️ Sevimlilar")
-async def show_favorites(
-    message: Message,
-    bot: Bot,
-):
-    await register_user(message)
-
-    if not await check_subscription(
-        bot,
-        message.from_user.id,
-    ):
-        await message.answer(
-            "📢 Kanalga obuna bo‘ling.",
-            reply_markup=force_sub_kb(),
-        )
-        return
-
-    try:
-        result = (
-            get_supabase()
-            .table("favorites")
-            .select("movie_id, movies(*)")
-            .eq("telegram_id", message.from_user.id)
-            .execute()
-        )
-
-        rows = result.data or []
-
-    except Exception as e:
-        logger.error(f"favorites list error: {e}")
-        await message.answer("❌ Xatolik.")
-        return
-
-    movies = []
-
-    for row in rows:
-        movie = row.get("movies")
-
-        if isinstance(movie, list):
-            movie = movie[0] if movie else None
-
-        if movie:
-            movies.append(movie)
-
-    if not movies:
-        await message.answer(
-            "❤️ Sevimlilar bo‘sh.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    text = "❤️ <b>Sevimlilaringiz:</b>\n\n"
-    buttons = []
-
-    for movie in movies:
-        text += f"🎬 {movie['title']}\n"
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=movie["title"][:40],
-                    callback_data=f"movie_{movie['id']}",
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🔙 Orqaga",
-                callback_data="back_main",
-            )
-        ]
-    )
-
-    await message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
-    )
-
-
-# =========================================================
-# GENRES
-# =========================================================
-
-@router.message(F.text == "🎭 Janrlar")
-async def show_genres(
-    message: Message,
-    bot: Bot,
-):
-    await register_user(message)
-
-    if not await check_subscription(
-        bot,
-        message.from_user.id,
-    ):
-        await message.answer(
-            "📢 Kanalga obuna bo‘ling.",
-            reply_markup=force_sub_kb(),
-        )
-        return
-
-    try:
-        result = (
-            get_supabase()
-            .table("genres")
-            .select("name")
-            .order("name")
-            .execute()
-        )
-
-        genres = [
-            x["name"]
-            for x in (result.data or [])
-            if x.get("name")
-        ]
-
-    except Exception as e:
-        logger.error(f"genres error: {e}")
-        await message.answer("❌ Xatolik.")
-        return
-
-    if not genres:
-        await message.answer("Janrlar yo‘q.")
-        return
-
-    await message.answer(
-        "🎭 <b>Janrni tanlang:</b>",
-        reply_markup=genres_kb(genres),
-    )
-
-
-@router.callback_query(F.data.startswith("genre_"))
-async def genre_movies(callback: CallbackQuery):
-    genre = callback.data[6:]
-
-    try:
-        result = (
-            get_supabase()
-            .table("movies")
-            .select("*")
-            .ilike("genre", f"%{genre}%")
-            .order("views", desc=True)
-            .limit(30)
-            .execute()
-        )
-
-        rows = result.data or []
-
-    except Exception as e:
-        logger.error(f"genre movies error: {e}")
-
-        await callback.answer(
-            "❌ Xatolik.",
-            show_alert=True,
-        )
-        return
-
-    if not rows:
-        await callback.answer(
-            "Bu janrda kino yo‘q.",
-            show_alert=True,
-        )
-        return
-
-    text = f"🎭 <b>{genre}</b>\n\n"
-    buttons = []
-
-    for row in rows:
-        text += (
-            f"🎬 {row['title']} "
-            f"({row.get('year') or '—'})\n"
-        )
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=row["title"][:35],
-                    callback_data=f"movie_{row['id']}",
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🔙 Orqaga",
-                callback_data="back_main",
-            )
-        ]
-    )
-
-    await callback.message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# POPULAR
-# =========================================================
-
-@router.message(F.text == "🔥 Eng ko‘p ko‘rilgan")
-async def popular_movies(
-    message: Message,
-    bot: Bot,
-):
-    await register_user(message)
-
-    if not await check_subscription(
-        bot,
-        message.from_user.id,
-    ):
-        await message.answer(
-            "📢 Kanalga obuna bo‘ling.",
-            reply_markup=force_sub_kb(),
-        )
-        return
-
-    try:
-        result = (
-            get_supabase()
-            .table("movies")
-            .select("*")
-            .order("views", desc=True)
-            .limit(10)
-            .execute()
-        )
-
-        rows = result.data or []
-
-    except Exception as e:
-        logger.error(f"popular movies error: {e}")
-        await message.answer("❌ Xatolik.")
-        return
-
-    if not rows:
-        await message.answer("Hali kino yo‘q.")
-        return
-
-    text = "🔥 <b>TOP 10</b>\n\n"
-    buttons = []
-
-    for i, row in enumerate(rows, 1):
-        text += (
-            f"{i}. {row['title']} — "
-            f"{row.get('views', 0):,} views\n"
-        )
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{i}. {row['title'][:30]}",
-                    callback_data=f"movie_{row['id']}",
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🔙 Orqaga",
-                callback_data="back_main",
-            )
-        ]
-    )
-
-    await message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
-    )
-
-
-# =========================================================
-# NEW MOVIES
-# =========================================================
-
-@router.message(F.text == "🆕 Yangi kinolar")
-async def new_movies(
-    message: Message,
-    bot: Bot,
-):
-    await register_user(message)
-
-    if not await check_subscription(
-        bot,
-        message.from_user.id,
-    ):
-        await message.answer(
-            "📢 Kanalga obuna bo‘ling.",
-            reply_markup=force_sub_kb(),
-        )
-        return
-
-    try:
-        result = (
-            get_supabase()
-            .table("movies")
-            .select("*")
-            .order("created_at", desc=True)
-            .limit(15)
-            .execute()
-        )
-
-        rows = result.data or []
-
-    except Exception as e:
-        logger.error(f"new movies error: {e}")
-        await message.answer("❌ Xatolik.")
-        return
-
-    if not rows:
-        await message.answer("Hali kino yo‘q.")
-        return
-
-    text = "🆕 <b>Yangi kinolar</b>\n\n"
-    buttons = []
-
-    for row in rows:
-        text += (
-            f"🎬 {row['title']} "
-            f"({row.get('year') or '—'})\n"
-        )
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=row["title"][:35],
-                    callback_data=f"movie_{row['id']}",
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🔙 Orqaga",
-                callback_data="back_main",
-            )
-        ]
-    )
-
-    await message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
-    )
-
-
-# =========================================================
-# ADMIN PANEL
-# =========================================================
-
-@router.message(Command("admin"))
-async def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    await message.answer(
-        "👨‍💻 <b>ADMIN PANEL</b>",
-        reply_markup=admin_menu_kb(),
-    )
-
-
-# =========================================================
-# ADMIN ADD
-# =========================================================
-
-@router.callback_query(F.data == "admin_add")
-async def admin_add_start(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    await state.set_state(AddMovie.code)
-
-    await callback.message.answer(
-        "1️⃣ Kino kodini yuboring:",
-        reply_markup=cancel_kb(),
-    )
-
-    await callback.answer()
-
-
-@router.message(AddMovie.code)
-async def add_code(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    code = (message.text or "").strip()
-
-    if not code:
-        await message.answer("❌ Kod bo‘sh bo‘lmasin.")
-        return
-
-    if await get_movie_by_code(code):
-        await message.answer(
-            "❌ Bu kod allaqachon mavjud."
-        )
-        return
-
-    await state.update_data(code=code)
-    await state.set_state(AddMovie.title)
-
-    await message.answer(
-        "2️⃣ Kino nomini yuboring:"
-    )
-
-
-@router.message(AddMovie.title)
-async def add_title(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    title = (message.text or "").strip()
-
-    if not title:
-        await message.answer("❌ Kino nomi bo‘sh bo‘lmasin.")
-        return
-
-    await state.update_data(title=title)
-    await state.set_state(AddMovie.alt_title)
-
-    await message.answer(
-        "3️⃣ Muqobil nomini yuboring yoki -:"
-    )
-
-
-@router.message(AddMovie.alt_title)
-async def add_alt(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    value = (message.text or "").strip()
-
-    if value == "-":
-        value = None
-
-    await state.update_data(
-        alternative_title=value
-    )
-
-    await state.set_state(AddMovie.description)
-
-    await message.answer(
-        "4️⃣ Tavsifni yuboring yoki -:"
-    )
-
-
-@router.message(AddMovie.description)
-async def add_desc(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    value = (message.text or "").strip()
-
-    if value == "-":
-        value = None
-
-    await state.update_data(description=value)
-    await state.set_state(AddMovie.year)
-
-    await message.answer(
-        "5️⃣ Yilini yuboring yoki -:"
-    )
-
-
-@router.message(AddMovie.year)
-async def add_year(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    value = (message.text or "").strip()
-    year = None
-
-    if value != "-":
-        try:
-            year = int(value)
-        except ValueError:
-            await message.answer(
-                "❌ Yil faqat raqam bo‘lishi kerak."
-            )
-            return
-
-    await state.update_data(year=year)
-    await state.set_state(AddMovie.genre)
-
-    await message.answer(
-        "6️⃣ Janrini yuboring:"
-    )
-
-
-@router.message(AddMovie.genre)
-async def add_genre(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    genre = (message.text or "").strip()
-
-    if not genre:
-        await message.answer("❌ Janr bo‘sh bo‘lmasin.")
-        return
-
-    await state.update_data(genre=genre)
-    await state.set_state(AddMovie.rating)
-
-    await message.answer(
-        "7️⃣ Reytingini yuboring yoki -:"
-    )
-
-
-@router.message(AddMovie.rating)
-async def add_rating(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    value = (message.text or "").strip()
-    rating = None
-
-    if value != "-":
-        try:
-            rating = float(value.replace(",", "."))
-        except ValueError:
-            await message.answer(
-                "❌ Reyting noto‘g‘ri."
-            )
-            return
-
-    await state.update_data(rating=rating)
-    await state.set_state(AddMovie.channel_id)
-
-    await message.answer(
-        "8️⃣ Kanal ID sini yuboring:\n\n"
-        "Masalan:\n"
-        "-1001234567890"
-    )
-
-
-@router.message(AddMovie.channel_id)
-async def add_channel(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    try:
-        channel_id = int((message.text or "").strip())
-    except ValueError:
-        await message.answer(
-            "❌ Channel ID noto‘g‘ri."
-        )
-        return
-
-    await state.update_data(channel_id=channel_id)
-    await state.set_state(AddMovie.message_id)
-
-    await message.answer(
-        "9️⃣ Telegram Message ID sini yuboring:"
-    )
-
-
-@router.message(AddMovie.message_id)
-async def add_message_id(
-    message: Message,
-    state: FSMContext,
-):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    try:
-        message_id = int((message.text or "").strip())
-    except ValueError:
-        await message.answer(
-            "❌ Message ID noto‘g‘ri."
-        )
-        return
-
-    data = await state.get_data()
-
-    await state.update_data(message_id=message_id)
-    data = await state.get_data()
-    await finish_add(message, state, data, fast=False)
-
-
-# =========================================================
-# FAST ADD: CHANNEL MESSAGE REPLY + /add
-# =========================================================
-
-async def save_movie_to_supabase(movie_data: Dict) -> tuple[bool, str]:
-    """Kinoni Supabase'ga xavfsiz saqlaydi va aniq xatoni qaytaradi."""
-    try:
-        sb = get_supabase()
-        result = sb.table("movies").insert(movie_data).execute()
-        if not result.data:
-            return False, "Supabase insert javobida ma'lumot qaytmadi."
+        r = get_supabase().table("movies").insert(movie_data).execute()
+        if not r.data:
+            return False, "Insert javobida ma'lumot yo'q."
         return True, ""
     except Exception as e:
-        logger.exception("movie insert error")
+        logger.exception("save_movie")
         return False, str(e)
 
 
-async def finish_add(message: Message, state: FSMContext, data: Dict, *, fast: bool = False):
-    """FSM'dagi ma'lumotlarni tekshiradi va kinoni bitta joydan saqlaydi."""
+async def finish_add(
+    message: Message,
+    state: FSMContext,
+    data: Dict,
+    *,
+    fast: bool = False,
+) -> None:
     required = ("code", "title", "genre", "channel_id", "message_id")
-    missing = [key for key in required if data.get(key) in (None, "")]
+    missing = [k for k in required if data.get(k) in (None, "")]
     if missing:
         await message.answer(
-            "❌ Ma'lumot yetishmayapti: " + ", ".join(missing) +
-            ". /add jarayonini qaytadan boshlang."
+            "❌ Ma'lumot yetishmayapti: " + ", ".join(missing) + "\nQaytadan boshlang."
         )
         await state.clear()
         return
@@ -1637,78 +423,515 @@ async def finish_add(message: Message, state: FSMContext, data: Dict, *, fast: b
 
     if await get_movie_by_code(movie_data["code"]):
         await message.answer(
-            f"❌ <b>{movie_data['code']}</b> kodi allaqachon mavjud.\n"
-            "Boshqa kod kiriting."
+            f"❌ <b>{safe_html(movie_data['code'])}</b> kodi allaqachon mavjud."
         )
         return
 
-    ok, error = await save_movie_to_supabase(movie_data)
+    ok, err = await save_movie(movie_data)
     if not ok:
         await message.answer(
-            "❌ <b>Kino bazaga qo‘shilmadi.</b>\n\n"
-            "Supabase xatosi:\n"
-            f"<code>{error[:3000]}</code>\n\n"
-            "Tekshiring: movies jadvalidagi ustun nomlari, RLS/policy va SUPABASE_KEY."
+            "❌ <b>Bazaga yozilmadi.</b>\n\n"
+            f"<code>{safe_html(err[:2000])}</code>"
         )
         return
 
     await state.clear()
-
     prefix = "tez " if fast else ""
     await message.answer(
         f"✅ <b>Kino {prefix}qo‘shildi!</b>\n\n"
-        f"🔢 Kod: <code>{movie_data['code']}</code>\n"
-        f"🎬 {movie_data['title']}\n"
-        f"🎭 Janr: {movie_data['genre']}\n"
-        f"📢 Kanal: <code>{movie_data['channel_id']}</code>\n"
-        f"💬 Message ID: <code>{movie_data['message_id']}</code>",
+        f"🔢 Kod: <code>{safe_html(movie_data['code'])}</code>\n"
+        f"🎬 {safe_html(movie_data['title'])}\n"
+        f"🎭 {safe_html(movie_data['genre'])}\n"
+        f"📢 <code>{movie_data['channel_id']}</code>\n"
+        f"💬 <code>{movie_data['message_id']}</code>",
         reply_markup=main_menu_kb(),
     )
 
 
 # =========================================================
-# FAST ADD: CHANNEL MESSAGE REPLY + /add
+# ROUTER
 # =========================================================
 
-@router.message(Command("add"))
-async def fast_add_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
+router = Router()
 
-    # Har bir yangi /add eski FSM jarayonini tozalaydi.
+
+# ---------------------------------------------------------
+# START / HELP
+# ---------------------------------------------------------
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     await state.clear()
+    await register_user(message)
 
-    replied = message.reply_to_message
-    if replied is None:
+    if not await check_subscription(bot, message.from_user.id):
         await message.answer(
-            "📌 Avval kanaldagi kino xabariga <b>Reply</b> qiling, "
-            "keyin shu reply ustiga <code>/add</code> yuboring."
+            "📢 Botdan foydalanish uchun kanalga obuna bo‘ling.\n\n"
+            "Obuna bo‘lgach «✅ Tekshirish» ni bosing.",
+            reply_markup=force_sub_kb(),
         )
         return
 
-    # /add qaysi xabarga reply qilingan bo‘lsa, aynan o‘sha
-    # Telegram chat_id + message_id bazaga yoziladi.
-    channel_id = replied.chat.id
-    message_id = replied.message_id
+    await message.answer(
+        "🎬 <b>Kino Bot</b>\n\nKerakli kinoni kod yoki nom orqali toping.",
+        reply_markup=main_menu_kb(),
+    )
 
-    if not channel_id or not message_id:
-        await message.answer("❌ Reply qilingan xabar ma'lumotlari topilmadi.")
+
+@router.message(Command("help"))
+@router.message(F.text == "ℹ️ Yordam")
+async def cmd_help(message: Message) -> None:
+    await register_user(message)
+    await message.answer(
+        "ℹ️ <b>Yordam</b>\n\n"
+        "🔢 Kod orqali — kino kodini yuboring\n"
+        "🔎 Nom orqali — kino nomini yozing\n"
+        "🎭 Janr — janr bo‘yicha\n"
+        "🔥 Mashhur — eng ko‘p ko‘rilganlar\n"
+        "❤️ Sevimlilar — tanlanganlar\n\n"
+        f"💬 Savollar: {SUPPORT_USERNAME}",
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ---------------------------------------------------------
+# SUBSCRIPTION
+# ---------------------------------------------------------
+
+@router.callback_query(F.data == "check_sub")
+async def check_sub_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if await check_subscription(bot, callback.from_user.id):
+        try:
+            await callback.message.edit_text("✅ Obuna tasdiqlandi!")
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(
+            "🎬 <b>Kino Bot</b>\n\nKerakli kinoni kod yoki nom orqali toping.",
+            reply_markup=main_menu_kb(),
+        )
+        await callback.answer()
+    else:
+        await callback.answer("❌ Hali obuna bo‘lmagansiz.", show_alert=True)
+
+
+@router.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.answer("🎬 Asosiy menyu", reply_markup=main_menu_kb())
+    await callback.answer()
+
+
+# ---------------------------------------------------------
+# SEARCH BY CODE
+# ---------------------------------------------------------
+
+@router.message(F.text == "🔢 Kod orqali qidirish")
+async def search_by_code_start(message: Message, state: FSMContext, bot: Bot) -> None:
+    await register_user(message)
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("📢 Kanalga obuna bo‘ling.", reply_markup=force_sub_kb())
         return
 
-    await state.update_data(
-        channel_id=channel_id,
-        message_id=message_id,
-    )
-    await state.set_state(FastAddMovie.code)
+    await state.clear()
+    await state.set_state(SearchCode.waiting)
+    await message.answer("🔢 Kino kodini yuboring:", reply_markup=cancel_kb())
 
+
+@router.message(StateFilter(SearchCode.waiting), F.text)
+async def search_by_code_process(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    code = (message.text or "").strip()
+    movie = await get_movie_by_code(code)
+    if not movie:
+        await message.answer("❌ Kino topilmadi.\nBoshqa kod yuboring.")
+        return
+
+    await state.clear()
+    fav = await is_favorite(message.from_user.id, movie["id"])
     await message.answer(
-        "1️⃣ Kino kodini yuboring:",
+        format_movie_card(movie),
+        reply_markup=movie_actions_kb(movie["id"], fav),
+    )
+
+
+# ---------------------------------------------------------
+# SEARCH BY TITLE
+# ---------------------------------------------------------
+
+@router.message(F.text == "🎬 Kino qidirish")
+async def search_by_title_start(message: Message, state: FSMContext, bot: Bot) -> None:
+    await register_user(message)
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("📢 Kanalga obuna bo‘ling.", reply_markup=force_sub_kb())
+        return
+
+    await state.clear()
+    await state.set_state(SearchTitle.waiting)
+    await message.answer("🎬 Kino nomini yozing:", reply_markup=cancel_kb())
+
+
+@router.message(StateFilter(SearchTitle.waiting), F.text)
+async def search_by_title_process(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    query = sanitize_query(message.text or "")
+    if len(query) < 2:
+        await message.answer("❌ Kamida 2 ta belgi yozing.")
+        return
+
+    try:
+        r = (
+            get_supabase()
+            .table("movies")
+            .select("*")
+            .or_(f"title.ilike.%{query}%,alternative_title.ilike.%{query}%")
+            .order("views", desc=True)
+            .limit(20)
+            .execute()
+        )
+        rows = r.data or []
+    except Exception as e:
+        logger.error("title search: %s", e)
+        await message.answer("❌ Qidirishda xatolik.")
+        return
+
+    if not rows:
+        await message.answer("❌ Hech narsa topilmadi.\nBoshqa nom yuboring.")
+        return
+
+    await state.clear()
+
+    if len(rows) == 1:
+        m = rows[0]
+        fav = await is_favorite(message.from_user.id, m["id"])
+        await message.answer(format_movie_card(m), reply_markup=movie_actions_kb(m["id"], fav))
+        return
+
+    text = "🔍 <b>Topilgan kinolar:</b>\n\n"
+    buttons: List[List[InlineKeyboardButton]] = []
+    for row in rows:
+        text += f"🎬 {safe_html(row['title'])} ({row.get('year') or '—'})\n"
+        buttons.append(
+            [InlineKeyboardButton(text=row["title"][:30], callback_data=f"movie_{row['id']}")]
+        )
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+# ---------------------------------------------------------
+# SHOW / WATCH MOVIE
+# ---------------------------------------------------------
+
+@router.callback_query(F.data.startswith("movie_"))
+async def show_movie_callback(callback: CallbackQuery) -> None:
+    try:
+        movie_id = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Noto‘g‘ri ID.", show_alert=True)
+        return
+
+    movie = await get_movie_by_id(movie_id)
+    if not movie:
+        await callback.answer("Kino topilmadi.", show_alert=True)
+        return
+
+    fav = await is_favorite(callback.from_user.id, movie_id)
+    await callback.message.answer(
+        format_movie_card(movie),
+        reply_markup=movie_actions_kb(movie_id, fav),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("watch_"))
+async def watch_movie(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        movie_id = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Noto‘g‘ri ID.", show_alert=True)
+        return
+
+    movie = await get_movie_by_id(movie_id)
+    if not movie:
+        await callback.answer("Kino topilmadi.", show_alert=True)
+        return
+
+    try:
+        await bot.copy_message(
+            chat_id=callback.from_user.id,
+            from_chat_id=movie["channel_id"],
+            message_id=movie["message_id"],
+        )
+        await increment_views(movie_id)
+        await callback.answer("🎬 Kino yuborildi ✅")
+    except TelegramForbiddenError:
+        await callback.answer("❌ Botni bloklagansiz.", show_alert=True)
+    except TelegramBadRequest as e:
+        logger.error("copy_message: %s", e)
+        await callback.answer("❌ Xabar topilmadi yoki o‘chirilgan.", show_alert=True)
+    except Exception as e:
+        logger.error("watch: %s", e)
+        await callback.answer("❌ Xatolik.", show_alert=True)
+
+
+# ---------------------------------------------------------
+# FAVORITES
+# ---------------------------------------------------------
+
+@router.callback_query(F.data.startswith("fav_"))
+async def add_favorite(callback: CallbackQuery) -> None:
+    try:
+        movie_id = int(callback.data.split("_", 1)[1])
+        get_supabase().table("favorites").upsert(
+            {"telegram_id": callback.from_user.id, "movie_id": movie_id},
+            on_conflict="telegram_id,movie_id",
+        ).execute()
+        await callback.answer("❤️ Qo‘shildi")
+        await callback.message.edit_reply_markup(
+            reply_markup=movie_actions_kb(movie_id, True)
+        )
+    except Exception as e:
+        logger.error("fav: %s", e)
+        await callback.answer("❌ Xatolik.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("unfav_"))
+async def remove_favorite(callback: CallbackQuery) -> None:
+    try:
+        movie_id = int(callback.data.split("_", 1)[1])
+        get_supabase().table("favorites").delete().eq(
+            "telegram_id", callback.from_user.id
+        ).eq("movie_id", movie_id).execute()
+        await callback.answer("💔 Olib tashlandi")
+        await callback.message.edit_reply_markup(
+            reply_markup=movie_actions_kb(movie_id, False)
+        )
+    except Exception as e:
+        logger.error("unfav: %s", e)
+        await callback.answer("❌ Xatolik.", show_alert=True)
+
+
+@router.message(F.text == "❤️ Sevimlilar")
+async def show_favorites(message: Message, bot: Bot) -> None:
+    await register_user(message)
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("📢 Kanalga obuna bo‘ling.", reply_markup=force_sub_kb())
+        return
+
+    try:
+        r = (
+            get_supabase()
+            .table("favorites")
+            .select("movie_id, movies(*)")
+            .eq("telegram_id", message.from_user.id)
+            .execute()
+        )
+        rows = r.data or []
+    except Exception as e:
+        logger.error("favorites: %s", e)
+        await message.answer("❌ Xatolik.")
+        return
+
+    movies = []
+    for row in rows:
+        m = row.get("movies")
+        if isinstance(m, list):
+            m = m[0] if m else None
+        if m:
+            movies.append(m)
+
+    if not movies:
+        await message.answer("❤️ Sevimlilar bo‘sh.", reply_markup=main_menu_kb())
+        return
+
+    text = "❤️ <b>Sevimlilaringiz:</b>\n\n"
+    buttons: List[List[InlineKeyboardButton]] = []
+    for m in movies:
+        text += f"🎬 {safe_html(m['title'])}\n"
+        buttons.append(
+            [InlineKeyboardButton(text=m["title"][:40], callback_data=f"movie_{m['id']}")]
+        )
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+# ---------------------------------------------------------
+# GENRES / POPULAR / NEW
+# ---------------------------------------------------------
+
+@router.message(F.text == "🎭 Janrlar")
+async def show_genres(message: Message, bot: Bot) -> None:
+    await register_user(message)
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("📢 Kanalga obuna bo‘ling.", reply_markup=force_sub_kb())
+        return
+
+    try:
+        r = get_supabase().table("genres").select("name").order("name").execute()
+        genres = [x["name"] for x in (r.data or []) if x.get("name")]
+    except Exception as e:
+        logger.error("genres: %s", e)
+        await message.answer("❌ Xatolik.")
+        return
+
+    if not genres:
+        await message.answer("Janrlar yo‘q.")
+        return
+
+    await message.answer("🎭 <b>Janrni tanlang:</b>", reply_markup=genres_kb(genres))
+
+
+@router.callback_query(F.data.startswith("genre_"))
+async def genre_movies(callback: CallbackQuery) -> None:
+    genre = callback.data[6:]
+    try:
+        r = (
+            get_supabase()
+            .table("movies")
+            .select("*")
+            .ilike("genre", f"%{genre}%")
+            .order("views", desc=True)
+            .limit(30)
+            .execute()
+        )
+        rows = r.data or []
+    except Exception as e:
+        logger.error("genre movies: %s", e)
+        await callback.answer("❌ Xatolik.", show_alert=True)
+        return
+
+    if not rows:
+        await callback.answer("Bu janrda kino yo‘q.", show_alert=True)
+        return
+
+    text = f"🎭 <b>{safe_html(genre)}</b>\n\n"
+    buttons: List[List[InlineKeyboardButton]] = []
+    for row in rows:
+        text += f"🎬 {safe_html(row['title'])} ({row.get('year') or '—'})\n"
+        buttons.append(
+            [InlineKeyboardButton(text=row["title"][:35], callback_data=f"movie_{row['id']}")]
+        )
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")])
+    await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.message(F.text == "🔥 Eng ko‘p ko‘rilgan")
+async def popular_movies(message: Message, bot: Bot) -> None:
+    await register_user(message)
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("📢 Kanalga obuna bo‘ling.", reply_markup=force_sub_kb())
+        return
+
+    try:
+        r = (
+            get_supabase()
+            .table("movies")
+            .select("*")
+            .order("views", desc=True)
+            .limit(10)
+            .execute()
+        )
+        rows = r.data or []
+    except Exception as e:
+        logger.error("popular: %s", e)
+        await message.answer("❌ Xatolik.")
+        return
+
+    if not rows:
+        await message.answer("Hali kino yo‘q.")
+        return
+
+    text = "🔥 <b>TOP 10</b>\n\n"
+    buttons: List[List[InlineKeyboardButton]] = []
+    for i, row in enumerate(rows, 1):
+        text += f"{i}. {safe_html(row['title'])} — {row.get('views', 0):,}\n"
+        buttons.append(
+            [InlineKeyboardButton(text=f"{i}. {row['title'][:30]}", callback_data=f"movie_{row['id']}")]
+        )
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.message(F.text == "🆕 Yangi kinolar")
+async def new_movies(message: Message, bot: Bot) -> None:
+    await register_user(message)
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("📢 Kanalga obuna bo‘ling.", reply_markup=force_sub_kb())
+        return
+
+    try:
+        r = (
+            get_supabase()
+            .table("movies")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(15)
+            .execute()
+        )
+        rows = r.data or []
+    except Exception as e:
+        logger.error("new movies: %s", e)
+        await message.answer("❌ Xatolik.")
+        return
+
+    if not rows:
+        await message.answer("Hali kino yo‘q.")
+        return
+
+    text = "🆕 <b>Yangi kinolar</b>\n\n"
+    buttons: List[List[InlineKeyboardButton]] = []
+    for row in rows:
+        text += f"🎬 {safe_html(row['title'])} ({row.get('year') or '—'})\n"
+        buttons.append(
+            [InlineKeyboardButton(text=row["title"][:35], callback_data=f"movie_{row['id']}")]
+        )
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+# ---------------------------------------------------------
+# ADMIN PANEL
+# ---------------------------------------------------------
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("👨‍💻 <b>ADMIN PANEL</b>", reply_markup=admin_menu_kb())
+
+
+# ---------------------------------------------------------
+# ADMIN ADD (to'liq FSM) — ASOSIY TUZATISH SHU YERDA
+# ---------------------------------------------------------
+
+@router.callback_query(F.data == "admin_add")
+async def admin_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    await state.clear()
+    await state.set_state(AddMovie.code)
+
+    await callback.message.answer(
+        "➕ <b>Kino qo‘shish</b>\n\n"
+        "1️⃣ Kino kodini yuboring:\n\n"
+        "<i>Bu qidiruv emas — yangi kino qo‘shish.</i>",
         reply_markup=cancel_kb(),
     )
+    await callback.answer()
 
 
-@router.message(FastAddMovie.code)
-async def fast_code(message: Message, state: FSMContext):
+@router.message(StateFilter(AddMovie.code), F.text)
+async def add_code(message: Message, state: FSMContext) -> None:
     if message.text == "❌ Bekor qilish":
         await state.clear()
         await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
@@ -1726,76 +949,96 @@ async def fast_code(message: Message, state: FSMContext):
         return
 
     await state.update_data(code=code)
-    await state.set_state(FastAddMovie.title)
+    await state.set_state(AddMovie.title)
     await message.answer("2️⃣ Kino nomini yuboring:")
 
 
-@router.message(FastAddMovie.title)
-async def fast_title(message: Message, state: FSMContext):
+@router.message(StateFilter(AddMovie.title), F.text)
+async def add_title(message: Message, state: FSMContext) -> None:
     if message.text == "❌ Bekor qilish":
         await state.clear()
         await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
+
     title = (message.text or "").strip()
     if not title:
         await message.answer("❌ Kino nomi bo‘sh bo‘lmasin.")
         return
+
     await state.update_data(title=title)
-    await state.set_state(FastAddMovie.description)
-    await message.answer("3️⃣ Tavsif yoki -:")
+    await state.set_state(AddMovie.alt_title)
+    await message.answer("3️⃣ Muqobil nom (yoki -):")
 
 
-@router.message(FastAddMovie.description)
-async def fast_desc(message: Message, state: FSMContext):
+@router.message(StateFilter(AddMovie.alt_title), F.text)
+async def add_alt(message: Message, state: FSMContext) -> None:
     if message.text == "❌ Bekor qilish":
         await state.clear()
         await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
+
+    value = (message.text or "").strip()
+    await state.update_data(alternative_title=None if value == "-" else value)
+    await state.set_state(AddMovie.description)
+    await message.answer("4️⃣ Tavsif (yoki -):")
+
+
+@router.message(StateFilter(AddMovie.description), F.text)
+async def add_desc(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
     value = (message.text or "").strip()
     await state.update_data(description=None if value == "-" else value)
-    await state.set_state(FastAddMovie.year)
-    await message.answer("4️⃣ Yil yoki -:")
+    await state.set_state(AddMovie.year)
+    await message.answer("5️⃣ Yil (yoki -):")
 
 
-@router.message(FastAddMovie.year)
-async def fast_year(message: Message, state: FSMContext):
+@router.message(StateFilter(AddMovie.year), F.text)
+async def add_year(message: Message, state: FSMContext) -> None:
     if message.text == "❌ Bekor qilish":
         await state.clear()
         await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
+
     value = (message.text or "").strip()
     year = None
     if value != "-":
         try:
             year = int(value)
+            if year < 1800 or year > datetime.now().year + 2:
+                await message.answer("❌ Yil noto‘g‘ri.")
+                return
         except ValueError:
-            await message.answer("❌ Yil faqat raqam bo‘lishi kerak.")
+            await message.answer("❌ Yil faqat raqam bo‘lsin.")
             return
-        if year < 1800 or year > datetime.now().year + 2:
-            await message.answer("❌ Yil noto‘g‘ri. Masalan: 2026")
-            return
+
     await state.update_data(year=year)
-    await state.set_state(FastAddMovie.genre)
-    await message.answer("5️⃣ Janr:")
+    await state.set_state(AddMovie.genre)
+    await message.answer("6️⃣ Janr:")
 
 
-@router.message(FastAddMovie.genre)
-async def fast_genre(message: Message, state: FSMContext):
+@router.message(StateFilter(AddMovie.genre), F.text)
+async def add_genre(message: Message, state: FSMContext) -> None:
     if message.text == "❌ Bekor qilish":
         await state.clear()
         await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
+
     genre = (message.text or "").strip()
     if not genre:
         await message.answer("❌ Janr bo‘sh bo‘lmasin.")
         return
+
     await state.update_data(genre=genre)
-    await state.set_state(FastAddMovie.rating)
-    await message.answer("6️⃣ Reyting yoki -:")
+    await state.set_state(AddMovie.rating)
+    await message.answer("7️⃣ Reyting (yoki -):")
 
 
-@router.message(FastAddMovie.rating)
-async def fast_rating(message: Message, state: FSMContext):
+@router.message(StateFilter(AddMovie.rating), F.text)
+async def add_rating(message: Message, state: FSMContext) -> None:
     if message.text == "❌ Bekor qilish":
         await state.clear()
         await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
@@ -1806,11 +1049,197 @@ async def fast_rating(message: Message, state: FSMContext):
     if value != "-":
         try:
             rating = float(value.replace(",", "."))
+            if not 0 <= rating <= 10:
+                await message.answer("❌ Reyting 0–10 oralig‘ida.")
+                return
         except ValueError:
-            await message.answer("❌ Reyting noto‘g‘ri. Masalan: 8.5")
+            await message.answer("❌ Reyting noto‘g‘ri.")
             return
-        if rating < 0 or rating > 10:
-            await message.answer("❌ Reyting 0 dan 10 gacha bo‘lishi kerak.")
+
+    await state.update_data(rating=rating)
+    await state.set_state(AddMovie.channel_id)
+    await message.answer(
+        "8️⃣ Kanal ID:\n\nMasalan:\n<code>-1001234567890</code>"
+    )
+
+
+@router.message(StateFilter(AddMovie.channel_id), F.text)
+async def add_channel(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    try:
+        channel_id = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Channel ID noto‘g‘ri.")
+        return
+
+    await state.update_data(channel_id=channel_id)
+    await state.set_state(AddMovie.message_id)
+    await message.answer("9️⃣ Message ID:")
+
+
+@router.message(StateFilter(AddMovie.message_id), F.text)
+async def add_message_id(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    try:
+        message_id = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Message ID noto‘g‘ri.")
+        return
+
+    await state.update_data(message_id=message_id)
+    data = await state.get_data()
+    await finish_add(message, state, data, fast=False)
+
+
+# ---------------------------------------------------------
+# FAST ADD: Reply + /add
+# ---------------------------------------------------------
+
+@router.message(Command("add"))
+async def fast_add_start(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    await state.clear()
+
+    replied = message.reply_to_message
+    if replied is None:
+        await message.answer(
+            "📌 Kanaldagi kino xabariga <b>Reply</b> qiling, "
+            "keyin <code>/add</code> yuboring."
+        )
+        return
+
+    await state.update_data(
+        channel_id=replied.chat.id,
+        message_id=replied.message_id,
+    )
+    await state.set_state(FastAddMovie.code)
+    await message.answer(
+        "➕ <b>Tez qo‘shish</b>\n\n1️⃣ Kino kodini yuboring:",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(StateFilter(FastAddMovie.code), F.text)
+async def fast_code(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    code = (message.text or "").strip()
+    if not code:
+        await message.answer("❌ Kod bo‘sh bo‘lmasin.")
+        return
+    if len(code) > 100:
+        await message.answer("❌ Kod juda uzun.")
+        return
+    if await get_movie_by_code(code):
+        await message.answer("❌ Bu kod allaqachon mavjud.")
+        return
+
+    await state.update_data(code=code)
+    await state.set_state(FastAddMovie.title)
+    await message.answer("2️⃣ Kino nomini yuboring:")
+
+
+@router.message(StateFilter(FastAddMovie.title), F.text)
+async def fast_title(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("❌ Nom bo‘sh bo‘lmasin.")
+        return
+
+    await state.update_data(title=title)
+    await state.set_state(FastAddMovie.description)
+    await message.answer("3️⃣ Tavsif (yoki -):")
+
+
+@router.message(StateFilter(FastAddMovie.description), F.text)
+async def fast_desc(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    value = (message.text or "").strip()
+    await state.update_data(description=None if value == "-" else value)
+    await state.set_state(FastAddMovie.year)
+    await message.answer("4️⃣ Yil (yoki -):")
+
+
+@router.message(StateFilter(FastAddMovie.year), F.text)
+async def fast_year(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    value = (message.text or "").strip()
+    year = None
+    if value != "-":
+        try:
+            year = int(value)
+            if year < 1800 or year > datetime.now().year + 2:
+                await message.answer("❌ Yil noto‘g‘ri.")
+                return
+        except ValueError:
+            await message.answer("❌ Yil faqat raqam.")
+            return
+
+    await state.update_data(year=year)
+    await state.set_state(FastAddMovie.genre)
+    await message.answer("5️⃣ Janr:")
+
+
+@router.message(StateFilter(FastAddMovie.genre), F.text)
+async def fast_genre(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    genre = (message.text or "").strip()
+    if not genre:
+        await message.answer("❌ Janr bo‘sh bo‘lmasin.")
+        return
+
+    await state.update_data(genre=genre)
+    await state.set_state(FastAddMovie.rating)
+    await message.answer("6️⃣ Reyting (yoki -):")
+
+
+@router.message(StateFilter(FastAddMovie.rating), F.text)
+async def fast_rating(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+        return
+
+    value = (message.text or "").strip()
+    rating = None
+    if value != "-":
+        try:
+            rating = float(value.replace(",", "."))
+            if not 0 <= rating <= 10:
+                await message.answer("❌ Reyting 0–10.")
+                return
+        except ValueError:
+            await message.answer("❌ Reyting noto‘g‘ri.")
             return
 
     await state.update_data(rating=rating)
@@ -1818,65 +1247,54 @@ async def fast_rating(message: Message, state: FSMContext):
     await finish_add(message, state, data, fast=True)
 
 
-# =========================================================
-# ADMIN MOVIES
-# =========================================================
+# ---------------------------------------------------------
+# ADMIN LIST / STATS / USERS
+# ---------------------------------------------------------
 
 @router.callback_query(F.data == "admin_list")
 @router.message(Command("movies"))
-async def admin_list(event: Message | CallbackQuery):
+async def admin_list(event: Union[Message, CallbackQuery]) -> None:
     if not is_admin(event.from_user.id):
         return
 
     try:
-        result = (
+        r = (
             get_supabase()
             .table("movies")
-            .select(
-                "id,code,title,channel_id,message_id,"
-                "views,year,genre,rating"
-            )
+            .select("id,code,title,channel_id,message_id,views,year,genre,rating")
             .order("id", desc=True)
-            .limit(50)
+            .limit(40)
             .execute()
         )
-
-        rows = result.data or []
-
+        rows = r.data or []
     except Exception as e:
-        logger.error(f"admin list error: {e}")
-
+        logger.error("admin list: %s", e)
+        text = "❌ Bazani o‘qishda xatolik."
         if isinstance(event, CallbackQuery):
-            await event.answer(
-                "❌ Bazani o‘qishda xatolik.",
-                show_alert=True,
-            )
+            await event.answer(text, show_alert=True)
         else:
-            await event.answer(
-                "❌ Bazani o‘qishda xatolik."
-            )
+            await event.answer(text)
         return
 
     if not rows:
         text = "📋 Bazada kino yo‘q."
     else:
-        parts = ["📋 <b>KINOLAR BAZASI</b>\n"]
-
+        parts = ["📋 <b>KINOLAR</b>\n"]
         for row in rows:
             parts.append(
                 "━━━━━━━━━━━━━━\n"
-                f"🆔 ID: <code>{row['id']}</code>\n"
-                f"🎬 <b>{row['title']}</b>\n"
-                f"🔢 Kod: <code>{row['code']}</code>\n"
-                f"📢 Kanal: <code>{row['channel_id']}</code>\n"
-                f"💬 Message ID: <code>{row['message_id']}</code>\n"
-                f"📅 Yil: {row.get('year') or '—'}\n"
-                f"🎭 Janr: {row.get('genre') or '—'}\n"
-                f"⭐ Reyting: {row.get('rating') if row.get('rating') is not None else '—'}\n"
-                f"👀 Ko‘rishlar: {row.get('views', 0)}"
+                f"🆔 <code>{row['id']}</code>\n"
+                f"🎬 <b>{safe_html(row['title'])}</b>\n"
+                f"🔢 <code>{safe_html(row['code'])}</code>\n"
+                f"📢 <code>{row['channel_id']}</code> | 💬 <code>{row['message_id']}</code>\n"
+                f"📅 {row.get('year') or '—'} | 🎭 {safe_html(row.get('genre') or '—')}\n"
+                f"⭐ {row.get('rating') if row.get('rating') is not None else '—'} | "
+                f"👀 {row.get('views', 0)}"
             )
-
         text = "\n".join(parts)
+
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n… (qisqartirildi)"
 
     if isinstance(event, CallbackQuery):
         await event.message.answer(text)
@@ -1885,54 +1303,28 @@ async def admin_list(event: Message | CallbackQuery):
         await event.answer(text)
 
 
-# =========================================================
-# ADMIN STATS
-# =========================================================
-
 @router.callback_query(F.data == "admin_stats")
 @router.message(Command("stats"))
-async def admin_stats(event: Message | CallbackQuery):
+async def admin_stats(event: Union[Message, CallbackQuery]) -> None:
     if not is_admin(event.from_user.id):
         return
 
     try:
-        users_result = (
+        users_r = get_supabase().table("users").select("id", count="exact").execute()
+        movies_r = get_supabase().table("movies").select("id", count="exact").execute()
+        views_r = get_supabase().table("movies").select("views").execute()
+        total_views = sum((x.get("views") or 0) for x in (views_r.data or []))
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        today_r = (
             get_supabase()
             .table("users")
             .select("id", count="exact")
+            .gte("last_activity", f"{today}T00:00:00+00:00")
             .execute()
         )
 
-        movies_result = (
-            get_supabase()
-            .table("movies")
-            .select("id", count="exact")
-            .execute()
-        )
-
-        movies = (
-            get_supabase()
-            .table("movies")
-            .select("views")
-            .execute()
-        )
-
-        total_views = sum(
-            (x.get("views") or 0)
-            for x in (movies.data or [])
-        )
-
-        today_start = datetime.now(timezone.utc).date().isoformat()
-
-        today_result = (
-            get_supabase()
-            .table("users")
-            .select("id", count="exact")
-            .gte("last_activity", f"{today_start}T00:00:00+00:00")
-            .execute()
-        )
-
-        top_result = (
+        top_r = (
             get_supabase()
             .table("movies")
             .select("title,views")
@@ -1940,35 +1332,21 @@ async def admin_stats(event: Message | CallbackQuery):
             .limit(1)
             .execute()
         )
-
-        top = (
-            top_result.data[0]
-            if top_result.data
-            else None
-        )
-
+        top = top_r.data[0] if top_r.data else None
         top_text = (
-            f"{top['title']} ({top.get('views', 0)} views)"
-            if top
-            else "—"
+            f"{safe_html(top['title'])} ({top.get('views', 0)})" if top else "—"
         )
 
         text = (
             "📊 <b>STATISTIKA</b>\n\n"
-            f"👥 Foydalanuvchilar: "
-            f"{users_result.count or 0}\n"
-            f"🎬 Kinolar: "
-            f"{movies_result.count or 0}\n"
-            f"👀 Jami ko‘rishlar: "
-            f"{total_views:,}\n"
-            f"🟢 Bugungi faol: "
-            f"{today_result.count or 0}\n"
-            f"🔥 Eng ko‘p ko‘rilgan: "
-            f"{top_text}"
+            f"👥 Foydalanuvchilar: {users_r.count or 0}\n"
+            f"🎬 Kinolar: {movies_r.count or 0}\n"
+            f"👀 Jami ko‘rishlar: {total_views:,}\n"
+            f"🟢 Bugungi faol: {today_r.count or 0}\n"
+            f"🔥 Top: {top_text}"
         )
-
     except Exception as e:
-        logger.error(f"admin stats error: {e}")
+        logger.error("stats: %s", e)
         text = "❌ Statistikani olishda xatolik."
 
     if isinstance(event, CallbackQuery):
@@ -1978,41 +1356,29 @@ async def admin_stats(event: Message | CallbackQuery):
         await event.answer(text)
 
 
-# =========================================================
-# ADMIN USERS
-# =========================================================
-
 @router.callback_query(F.data == "admin_users")
 @router.message(Command("users"))
-async def admin_users(event: Message | CallbackQuery):
+async def admin_users(event: Union[Message, CallbackQuery]) -> None:
     if not is_admin(event.from_user.id):
         return
 
     try:
-        total_result = (
-            get_supabase()
-            .table("users")
-            .select("id", count="exact")
-            .execute()
-        )
-
-        blocked_result = (
+        total = get_supabase().table("users").select("id", count="exact").execute()
+        blocked = (
             get_supabase()
             .table("users")
             .select("id", count="exact")
             .eq("is_blocked", True)
             .execute()
         )
-
         text = (
             "👥 <b>FOYDALANUVCHILAR</b>\n\n"
-            f"👤 Jami: {total_result.count or 0}\n"
-            f"🚫 Bloklagan: {blocked_result.count or 0}"
+            f"👤 Jami: {total.count or 0}\n"
+            f"🚫 Bloklagan: {blocked.count or 0}"
         )
-
     except Exception as e:
-        logger.error(f"admin users error: {e}")
-        text = "❌ Foydalanuvchilarni olishda xatolik."
+        logger.error("users: %s", e)
+        text = "❌ Xatolik."
 
     if isinstance(event, CallbackQuery):
         await event.message.answer(text)
@@ -2021,153 +1387,91 @@ async def admin_users(event: Message | CallbackQuery):
         await event.answer(text)
 
 
-# =========================================================
+# ---------------------------------------------------------
 # ADMIN DELETE
-# =========================================================
+# ---------------------------------------------------------
 
 @router.callback_query(F.data == "admin_delete")
-async def admin_delete_start(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
+async def admin_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
         return
 
+    await state.clear()
     await state.set_state(AdminDelete.confirm)
-
     await callback.message.answer(
         "🗑 O‘chirmoqchi bo‘lgan kino kodini yuboring:",
         reply_markup=cancel_kb(),
     )
-
     await callback.answer()
 
 
-@router.message(AdminDelete.confirm)
-async def admin_delete_confirm(
-    message: Message,
-    state: FSMContext,
-):
+@router.message(StateFilter(AdminDelete.confirm), F.text)
+async def admin_delete_confirm(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
 
     if message.text == "❌ Bekor qilish":
         await state.clear()
-
-        await message.answer(
-            "Bekor qilindi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
         return
 
     code = (message.text or "").strip()
-
     movie = await get_movie_by_code(code)
-
     if not movie:
-        await message.answer(
-            "❌ Kino topilmadi."
-        )
+        await message.answer("❌ Kino topilmadi.")
         await state.clear()
         return
 
-    await state.update_data(
-        movie_id=movie["id"]
-    )
-
+    await state.update_data(movie_id=movie["id"])
     await message.answer(
-        "⚠️ <b>Rostdan ham o‘chirmoqchimisiz?</b>\n\n"
-        f"🎬 {movie['title']}\n"
-        f"🔢 Kod: {movie['code']}",
-        reply_markup=confirm_delete_kb(
-            movie["id"]
-        ),
+        "⚠️ <b>Rostdan o‘chirmoqchimisiz?</b>\n\n"
+        f"🎬 {safe_html(movie['title'])}\n"
+        f"🔢 {safe_html(movie['code'])}",
+        reply_markup=confirm_delete_kb(movie["id"]),
     )
 
 
 @router.callback_query(F.data.startswith("del_yes_"))
-async def del_yes(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
+async def del_yes(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
         return
 
     try:
-        movie_id = int(
-            callback.data.split("_")[2]
-        )
-
-        # FK sababli favorites avval o‘chiriladi.
-        (
-            get_supabase()
-            .table("favorites")
-            .delete()
-            .eq("movie_id", movie_id)
-            .execute()
-        )
-
-        (
-            get_supabase()
-            .table("movies")
-            .delete()
-            .eq("id", movie_id)
-            .execute()
-        )
-
+        movie_id = int(callback.data.split("_")[2])
+        get_supabase().table("favorites").delete().eq("movie_id", movie_id).execute()
+        get_supabase().table("movies").delete().eq("id", movie_id).execute()
         await state.clear()
-
-        await callback.message.edit_text(
-            "✅ Kino o‘chirildi."
-        )
-
+        await callback.message.edit_text("✅ Kino o‘chirildi.")
         await callback.answer()
-
     except Exception as e:
-        logger.error(f"delete movie error: {e}")
-
-        await callback.answer(
-            "❌ O‘chirishda xatolik.",
-            show_alert=True,
-        )
+        logger.error("delete: %s", e)
+        await callback.answer("❌ O‘chirishda xatolik.", show_alert=True)
 
 
 @router.callback_query(F.data == "del_no")
-async def del_no(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
+async def del_no(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-
-    await callback.message.edit_text(
-        "❌ Bekor qilindi."
-    )
-
+    await callback.message.edit_text("❌ Bekor qilindi.")
     await callback.answer()
 
 
-# =========================================================
+# ---------------------------------------------------------
 # BROADCAST
-# =========================================================
+# ---------------------------------------------------------
 
 @router.callback_query(F.data == "admin_broadcast")
 @router.message(Command("broadcast"))
-async def broadcast_start(
-    event: Message | CallbackQuery,
-    state: FSMContext,
-):
+async def broadcast_start(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
     if not is_admin(event.from_user.id):
         return
 
+    await state.clear()
     await state.set_state(Broadcast.waiting)
-
     text = (
         "📢 Reklama xabarini yuboring.\n\n"
-        "Matn, rasm, video yoki document "
-        "yuborishingiz mumkin.\n\n"
-        "Bekor qilish: /cancel"
+        "Matn, rasm, video yoki document mumkin.\n\n"
+        "Bekor: /cancel"
     )
-
     if isinstance(event, CallbackQuery):
         await event.message.answer(text)
         await event.answer()
@@ -2176,230 +1480,152 @@ async def broadcast_start(
 
 
 @router.message(Command("cancel"))
-async def cancel_any(
-    message: Message,
-    state: FSMContext,
-):
+async def cancel_any(message: Message, state: FSMContext) -> None:
     await state.clear()
-
-    await message.answer(
-        "Bekor qilindi.",
-        reply_markup=main_menu_kb(),
-    )
+    await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
 
 
-@router.message(Broadcast.waiting)
-async def broadcast_process(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-):
+@router.message(StateFilter(Broadcast.waiting))
+async def broadcast_process(message: Message, state: FSMContext, bot: Bot) -> None:
     if not is_admin(message.from_user.id):
         return
 
     await state.clear()
 
     try:
-        result = (
+        r = (
             get_supabase()
             .table("users")
             .select("telegram_id")
             .eq("is_blocked", False)
             .execute()
         )
-
-        users = [
-            row["telegram_id"]
-            for row in (result.data or [])
-        ]
-
+        users = [row["telegram_id"] for row in (r.data or [])]
     except Exception as e:
-        logger.error(f"broadcast users error: {e}")
-
-        await message.answer(
-            "❌ Foydalanuvchilarni olishda xatolik."
-        )
+        logger.error("broadcast users: %s", e)
+        await message.answer("❌ Foydalanuvchilarni olishda xatolik.")
         return
 
-    success = 0
-    failed = 0
-    blocked = 0
+    success = failed = blocked = 0
+    status = await message.answer("📢 Yuborilmoqda...")
 
-    for user_id in users:
+    for i, uid in enumerate(users, 1):
         try:
             if message.photo:
-                await bot.send_photo(
-                    user_id,
-                    message.photo[-1].file_id,
-                    caption=message.caption,
-                )
-
+                await bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
             elif message.video:
-                await bot.send_video(
-                    user_id,
-                    message.video.file_id,
-                    caption=message.caption,
-                )
-
+                await bot.send_video(uid, message.video.file_id, caption=message.caption)
             elif message.document:
-                await bot.send_document(
-                    user_id,
-                    message.document.file_id,
-                    caption=message.caption,
-                )
-
+                await bot.send_document(uid, message.document.file_id, caption=message.caption)
             elif message.audio:
-                await bot.send_audio(
-                    user_id,
-                    message.audio.file_id,
-                    caption=message.caption,
-                )
-
+                await bot.send_audio(uid, message.audio.file_id, caption=message.caption)
             elif message.animation:
-                await bot.send_animation(
-                    user_id,
-                    message.animation.file_id,
-                    caption=message.caption,
-                )
-
+                await bot.send_animation(uid, message.animation.file_id, caption=message.caption)
             else:
-                await bot.send_message(
-                    user_id,
-                    message.text or message.caption or "",
-                )
+                await bot.send_message(uid, message.text or message.caption or "")
 
             success += 1
+            await asyncio.sleep(0.07)
 
-            # Telegram rate limitga tushmaslik uchun kichik pauza.
-            await asyncio.sleep(0.05)
-
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.send_message(uid, message.text or message.caption or "")
+                success += 1
+            except Exception:
+                failed += 1
         except TelegramForbiddenError:
             blocked += 1
-
             try:
-                (
-                    get_supabase()
-                    .table("users")
-                    .update({"is_blocked": True})
-                    .eq("telegram_id", user_id)
-                    .execute()
-                )
+                get_supabase().table("users").update({"is_blocked": True}).eq(
+                    "telegram_id", uid
+                ).execute()
             except Exception as e:
-                logger.warning(
-                    f"block status update error {user_id}: {e}"
-                )
-
+                logger.warning("block update %s: %s", uid, e)
         except Exception as e:
             failed += 1
+            logger.warning("broadcast %s: %s", uid, e)
 
-            logger.warning(
-                f"broadcast {user_id}: {e}"
-            )
+        if i % 50 == 0:
+            try:
+                await status.edit_text(
+                    f"📢 {i}/{len(users)}\n✅ {success} | ❌ {failed} | 🚫 {blocked}"
+                )
+            except TelegramBadRequest:
+                pass
 
     await message.answer(
-        "📢 <b>Reklama yakunlandi</b>\n\n"
-        f"✅ Yuborildi: {success}\n"
-        f"❌ Xatolik: {failed}\n"
-        f"🚫 Bloklagan: {blocked}"
+        "📢 <b>Yakunlandi</b>\n\n"
+        f"✅ {success}\n❌ {failed}\n🚫 {blocked}"
     )
 
 
-# =========================================================
-# FORCE SUB INFO
-# =========================================================
+# ---------------------------------------------------------
+# FORCE SUB / SETTINGS / EDIT
+# ---------------------------------------------------------
 
 @router.callback_query(F.data == "admin_force_sub")
-async def admin_force_info(callback: CallbackQuery):
+async def admin_force_info(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
-
     await callback.message.answer(
         f"📢 <b>Majburiy obuna</b>\n\n"
-        f"Kanal ID:\n"
-        f"<code>{CHANNEL_ID}</code>\n\n"
-        "Bot kanal administratori bo‘lishi kerak."
+        f"Kanal ID: <code>{CHANNEL_ID}</code>\n"
+        f"Username: {CHANNEL_USERNAME or '—'}\n\n"
+        "Bot kanal admini bo‘lishi kerak."
     )
-
     await callback.answer()
 
 
-# =========================================================
-# SETTINGS
-# =========================================================
-
 @router.callback_query(F.data == "admin_settings")
-async def admin_settings(callback: CallbackQuery):
+async def admin_settings(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
-
     await callback.message.answer(
         "⚙️ <b>SOZLAMALAR</b>\n\n"
-        f"🤖 BOT_TOKEN: "
-        f"{'Sozlangan' if BOT_TOKEN else 'Yo‘q'}\n"
+        f"🤖 BOT_TOKEN: {'✅' if BOT_TOKEN else '❌'}\n"
         f"👨‍💻 ADMIN_IDS: {ADMIN_IDS}\n"
         f"📢 CHANNEL_ID: <code>{CHANNEL_ID}</code>\n"
+        f"📢 CHANNEL_USERNAME: {CHANNEL_USERNAME or '—'}\n"
         f"💬 SUPPORT: {SUPPORT_USERNAME}\n"
         "🗄 DATABASE: Supabase ✅"
     )
-
     await callback.answer()
 
-
-# =========================================================
-# ADMIN EDIT INFO
-# =========================================================
 
 @router.callback_query(F.data == "admin_edit")
-async def admin_edit_info(callback: CallbackQuery):
+async def admin_edit_info(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
-
     await callback.message.answer(
         "✏️ <b>Kino tahrirlash</b>\n\n"
-        "Kino ma’lumotlari Supabase bazasida saqlanadi.\n\n"
-        "Hozirgi versiyada qo‘shish, qidirish, "
-        "o‘chirish va ko‘rish funksiyalari ishlaydi.\n"
-        "Tahrirlash uchun Supabase jadvalidan "
-        "ma’lumotni o‘zgartirish mumkin."
+        "Hozircha Supabase dashboard orqali tahrirlang.\n"
+        "Keyingi versiyada to‘liq FSM tahrirlash qo‘shiladi."
     )
-
     await callback.answer()
 
 
-# =========================================================
-# FALLBACK SEARCH
-# =========================================================
+# ---------------------------------------------------------
+# FALLBACK SEARCH (faqat holat yo'q bo'lganda)
+# ---------------------------------------------------------
 
 @router.message(F.text)
-async def fallback_text(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-):
+async def fallback_text(message: Message, state: FSMContext, bot: Bot) -> None:
     current = await state.get_state()
-
     if current is not None:
-        return
+        return  # FSM jarayonida — hech narsa qilmaymiz
 
     await register_user(message)
-
-    if not await check_subscription(
-        bot,
-        message.from_user.id,
-    ):
-        await message.answer(
-            "📢 Kanalga obuna bo‘ling.",
-            reply_markup=force_sub_kb(),
-        )
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("📢 Kanalga obuna bo‘ling.", reply_markup=force_sub_kb())
         return
 
-    query = (message.text or "").strip()
-
+    query = sanitize_query(message.text or "")
     if len(query) < 2:
         return
 
     try:
-        result = (
+        r = (
             get_supabase()
             .table("movies")
             .select("*")
@@ -2412,123 +1638,63 @@ async def fallback_text(
             .limit(15)
             .execute()
         )
-
-        rows = result.data or []
-
+        rows = r.data or []
     except Exception as e:
-        logger.error(f"fallback search error: {e}")
-
-        await message.answer(
-            "❌ Qidirishda xatolik."
-        )
+        logger.error("fallback: %s", e)
+        await message.answer("❌ Qidirishda xatolik.")
         return
 
     if not rows:
-        await message.answer(
-            "❌ Hech narsa topilmadi.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("❌ Hech narsa topilmadi.", reply_markup=main_menu_kb())
         return
 
     if len(rows) == 1:
-        movie = rows[0]
-
-        favorite = await is_favorite(
-            message.from_user.id,
-            movie["id"],
-        )
-
-        await message.answer(
-            format_movie_card(movie),
-            reply_markup=movie_actions_kb(
-                movie["id"],
-                favorite,
-            ),
-        )
+        m = rows[0]
+        fav = await is_favorite(message.from_user.id, m["id"])
+        await message.answer(format_movie_card(m), reply_markup=movie_actions_kb(m["id"], fav))
         return
 
     text = "🔍 <b>Natijalar:</b>\n\n"
-    buttons = []
-
+    buttons: List[List[InlineKeyboardButton]] = []
     for row in rows:
-        text += f"🎬 {row['title']}\n"
-
+        text += f"🎬 {safe_html(row['title'])}\n"
         buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=row["title"][:35],
-                    callback_data=f"movie_{row['id']}",
-                )
-            ]
+            [InlineKeyboardButton(text=row["title"][:35], callback_data=f"movie_{row['id']}")]
         )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🔙 Orqaga",
-                callback_data="back_main",
-            )
-        ]
-    )
-
-    await message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
-    )
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 # =========================================================
 # MAIN
 # =========================================================
 
-async def main():
+async def main() -> None:
     global supabase
 
     if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN .env faylda yo‘q!")
+        print("ERROR: BOT_TOKEN yo‘q!")
         return
-
     if not ADMIN_IDS:
-        print("ERROR: ADMIN_IDS .env faylda yo‘q!")
+        print("ERROR: ADMIN_IDS yo‘q!")
+        return
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("ERROR: SUPABASE_URL yoki SUPABASE_KEY yo‘q!")
         return
 
-    if not SUPABASE_URL:
-        print("ERROR: SUPABASE_URL .env faylda yo‘q!")
-        return
-
-    if not SUPABASE_KEY:
-        print("ERROR: SUPABASE_KEY .env faylda yo‘q!")
-        return
-
-    supabase = create_client(
-        SUPABASE_URL,
-        SUPABASE_KEY,
-    )
-
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     await ensure_default_genres()
 
     bot = Bot(
         token=BOT_TOKEN,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.HTML,
-        ),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-
-    dp = Dispatcher(
-        storage=MemoryStorage()
-    )
-
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info(
-        "Kino Bot + Supabase starting..."
-    )
-
+    logger.info("Kino Bot ishga tushmoqda...")
     try:
         await dp.start_polling(bot)
-
     finally:
         await bot.session.close()
 
