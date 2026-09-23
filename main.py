@@ -10,8 +10,10 @@ from html import escape
 from typing import Any, Callable, Coroutine, Dict, List, Optional, TypeVar, Union
 from zoneinfo import ZoneInfo
 
+import httpx
 from dotenv import load_dotenv
-from supabase import Client, create_client
+from postgrest.exceptions import APIError
+from supabase import AsyncClient, create_async_client
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -63,13 +65,22 @@ ACTIVITY_UPDATE_INTERVAL = 60  # last_activity yangilanish oralig'i (soniya)
 BROADCAST_DELAY = 0.04     # reklama orasidagi kutish (20 msg/s)
 MESSAGE_PART_LIMIT = 4000  # Telegram 4096 dan xavfsiz chegara
 
+# Bazaga murojaat sozlamalari
+DB_TIMEOUT = 12.0          # bitta so'rov uchun maksimal kutish vaqti (soniya)
+DB_RETRIES = 2             # tarmoq xatosida qayta urinishlar soni
+DB_RETRY_DELAY = 0.4       # urinishlar orasidagi bazaviy kutish (soniya)
+
+# Xotiradagi vaqtinchalik keshlarni tozalash oralig'i
+MEMORY_CLEANUP_INTERVAL = 3600       # 1 soat
+MEMORY_ENTRY_MAX_AGE = 6 * 3600      # 6 soatdan eski yozuvlar o'chiriladi
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("kino_bot")
 
-supabase: Optional[Client] = None
+supabase: Optional[AsyncClient] = None
 UZ_TZ = ZoneInfo("Asia/Tashkent")
 
 T = TypeVar("T")
@@ -149,10 +160,63 @@ genre_cache = TTLCache(GENRE_CACHE_TTL)
 
 
 # ============================================================================
+# BAZAGA XAVFSIZ MUROJAAT (async, timeout + qayta urinish)
+# ============================================================================
+#
+# MUHIM: bu botning asosiy tuzatishi. Avvalgi versiyada Supabase'ning
+# SINXRON clienti ishlatilgan va .execute() hech qachon await qilinmagan —
+# bu esa har bir bazaga murojaatda BUTUN asyncio event loop'ni bloklagan.
+# Natijada foydalanuvchilar ko'p bo'lganda yoki ma'lumot ko'payganda bot
+# "qotib qolgan". Endi hamma narsa AsyncClient orqali, to'liq await bilan
+# va tarmoq xatolarida avtomatik qayta urinish bilan ishlaydi.
+
+RETRYABLE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    httpx.PoolTimeout,
+)
+
+
+async def db(builder: Any, *, context: str = "", retries: int = DB_RETRIES) -> Any:
+    """Har qanday Supabase so'rovini (builder, .execute() chaqirilmagan holda)
+    xavfsiz bajaradi: timeout qo'yadi va tarmoq xatolarida qayta urinadi.
+
+    Foydalanish:
+        result = await db(get_sb().table("movies").select("*").eq("id", 1), context="movie_by_id")
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return await asyncio.wait_for(builder.execute(), timeout=DB_TIMEOUT)
+        except asyncio.TimeoutError as e:
+            last_exc = e
+            logger.warning(
+                "DB timeout (%s), urinish %s/%s", context, attempt + 1, retries + 1
+            )
+        except RETRYABLE_EXCEPTIONS as e:
+            last_exc = e
+            logger.warning(
+                "DB tarmoq xatosi (%s): %s — urinish %s/%s",
+                context, e, attempt + 1, retries + 1,
+            )
+        except APIError:
+            # Bu DB darajasidagi mantiqiy xato (masalan schema xatosi) —
+            # qayta urinish foydasiz, darhol yuqoriga uzatamiz.
+            raise
+        if attempt < retries:
+            await asyncio.sleep(DB_RETRY_DELAY * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+# ============================================================================
 # YORDAMCHI FUNKSIYALAR
 # ============================================================================
 
-def get_sb() -> Client:
+def get_sb() -> AsyncClient:
     if supabase is None:
         raise RuntimeError("Supabase ulanmagan.")
     return supabase
@@ -338,15 +402,19 @@ def source_cancel_kb() -> InlineKeyboardMarkup:
 # ============================================================================
 
 async def _load_force_channels() -> List[Dict[str, Any]]:
-    result = (
-        get_sb()
-        .table("force_channels")
-        .select("*")
-        .eq("is_active", True)
-        .order("id")
-        .execute()
-    )
-    return result.data or []
+    try:
+        result = await db(
+            get_sb()
+            .table("force_channels")
+            .select("*")
+            .eq("is_active", True)
+            .order("id"),
+            context="_load_force_channels",
+        )
+        return result.data or []
+    except Exception as e:
+        logger.error("_load_force_channels: %s", e)
+        return []
 
 
 async def get_force_channels() -> List[Dict[str, Any]]:
@@ -447,7 +515,6 @@ async def register_user(message: Message) -> None:
     _last_activity[user.id] = now
 
     try:
-        sb = get_sb()
         data = {
             "telegram_id": user.id,
             "username": user.username,
@@ -456,19 +523,22 @@ async def register_user(message: Message) -> None:
             "is_blocked": False,
         }
         # select-then-insert o'rniga bitta upsert: parallel startlarda ham xatosiz
-        sb.table("users").upsert(data, on_conflict="telegram_id").execute()
+        await db(
+            get_sb().table("users").upsert(data, on_conflict="telegram_id"),
+            context="register_user",
+        )
     except Exception as e:
         logger.warning("register_user: %s", e)
 
 
 async def mark_blocked(user_id: int) -> None:
     try:
-        (
+        await db(
             get_sb()
             .table("users")
             .update({"is_blocked": True})
-            .eq("telegram_id", user_id)
-            .execute()
+            .eq("telegram_id", user_id),
+            context="mark_blocked",
         )
     except Exception as e:
         logger.warning("mark_blocked: %s", e)
@@ -480,13 +550,9 @@ async def mark_blocked(user_id: int) -> None:
 
 async def movie_by_code(code: str) -> Optional[Dict[str, Any]]:
     try:
-        result = (
-            get_sb()
-            .table("movies")
-            .select("*")
-            .eq("code", code)
-            .limit(1)
-            .execute()
+        result = await db(
+            get_sb().table("movies").select("*").eq("code", code).limit(1),
+            context="movie_by_code",
         )
         return result.data[0] if result.data else None
     except Exception as e:
@@ -496,13 +562,9 @@ async def movie_by_code(code: str) -> Optional[Dict[str, Any]]:
 
 async def movie_by_id(movie_id: int) -> Optional[Dict[str, Any]]:
     try:
-        result = (
-            get_sb()
-            .table("movies")
-            .select("*")
-            .eq("id", movie_id)
-            .limit(1)
-            .execute()
+        result = await db(
+            get_sb().table("movies").select("*").eq("id", movie_id).limit(1),
+            context="movie_by_id",
         )
         return result.data[0] if result.data else None
     except Exception as e:
@@ -513,21 +575,24 @@ async def movie_by_id(movie_id: int) -> Optional[Dict[str, Any]]:
 async def inc_views(movie_id: int) -> None:
     """ATOMIK increment - RPC orqali (read-write race condition'siz)."""
     try:
-        get_sb().rpc("increment_views", {"p_movie_id": movie_id}).execute()
+        await db(
+            get_sb().rpc("increment_views", {"p_movie_id": movie_id}),
+            context="inc_views",
+        )
     except Exception as e:
         logger.warning("inc_views: %s", e)
 
 
 async def is_fav(telegram_id: int, movie_id: int) -> bool:
     try:
-        result = (
+        result = await db(
             get_sb()
             .table("favorites")
             .select("id")
             .eq("telegram_id", telegram_id)
             .eq("movie_id", movie_id)
-            .limit(1)
-            .execute()
+            .limit(1),
+            context="is_fav",
         )
         return bool(result.data)
     except Exception as e:
@@ -561,14 +626,15 @@ def movie_card(movie: Dict[str, Any]) -> str:
 
 
 async def _load_genres() -> List[Dict[str, Any]]:
-    result = (
-        get_sb()
-        .table("genres")
-        .select("id,name")
-        .order("name")
-        .execute()
-    )
-    return result.data or []
+    try:
+        result = await db(
+            get_sb().table("genres").select("id,name").order("name"),
+            context="_load_genres",
+        )
+        return result.data or []
+    except Exception as e:
+        logger.error("_load_genres: %s", e)
+        return []
 
 
 async def get_genres() -> List[Dict[str, Any]]:
@@ -585,32 +651,47 @@ async def ensure_genres() -> None:
         "Drama", "Thriller", "Family", "Animation", "Crime", "Adventure",
         "Mystery", "War", "History",
     ]
-    for genre in genres:
-        try:
-            get_sb().table("genres").upsert({"name": genre}, on_conflict="name").execute()
-        except Exception as e:
-            logger.warning("genre %s: %s", genre, e)
+    try:
+        # 15 ta alohida so'rov o'rniga BITTA batch upsert - startup tezlashadi
+        await db(
+            get_sb()
+            .table("genres")
+            .upsert([{"name": g} for g in genres], on_conflict="name"),
+            context="ensure_genres",
+        )
+    except Exception as e:
+        logger.warning("ensure_genres: %s", e)
     genre_cache.invalidate("genres")
 
 
 async def ensure_custom_genres(genre_text: str) -> None:
-    names = [x.strip() for x in genre_text.split(",") if x.strip()]
-    for name in names:
-        try:
-            get_sb().table("genres").upsert(
-                {"name": name[:100]}, on_conflict="name"
-            ).execute()
-        except Exception as e:
-            logger.warning("custom genre %s: %s", name, e)
-    genre_cache.invalidate("genres")
+    names = [x.strip()[:100] for x in genre_text.split(",") if x.strip()]
+    if not names:
+        return
+    try:
+        await db(
+            get_sb()
+            .table("genres")
+            .upsert([{"name": n} for n in names], on_conflict="name"),
+            context="ensure_custom_genres",
+        )
+        genre_cache.invalidate("genres")
+    except Exception as e:
+        logger.warning("ensure_custom_genres: %s", e)
 
 
 async def save_movie(data: Dict[str, Any]) -> tuple[bool, str]:
     try:
-        result = get_sb().table("movies").insert(data).execute()
+        result = await db(get_sb().table("movies").insert(data), context="save_movie")
         if not result.data:
             return False, "Bazaga qo'shish javobi bo'sh."
         return True, ""
+    except APIError as e:
+        logger.exception("save_movie")
+        message = getattr(e, "message", None) or str(e)
+        if "duplicate" in message.lower() or "unique" in message.lower():
+            return False, "Bu kod allaqachon mavjud (bazada band)."
+        return False, message
     except Exception as e:
         logger.exception("save_movie")
         return False, str(e)
@@ -730,14 +811,14 @@ async def search_movies(query: str) -> List[Dict[str, Any]]:
         return []
     q = or_safe(query)
     try:
-        result = (
+        result = await db(
             get_sb()
             .table("movies")
             .select("*")
             .or_(f"title.ilike.%{q}%,alternative_title.ilike.%{q}%,code.eq.{q}")
             .order("views", desc=True)
-            .limit(SEARCH_LIMIT)
-            .execute()
+            .limit(SEARCH_LIMIT),
+            context="search_movies",
         )
         return result.data or []
     except Exception as e:
@@ -789,9 +870,25 @@ class ThrottlingMiddleware(BaseMiddleware):
                         await event.answer("⏳ Iltimos, biroz kuting...")
                     except Exception:
                         pass
+                elif isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer("⏳ Iltimos, biroz kuting...")
+                    except Exception:
+                        pass
                 return None
             self._last[user.id] = now
         return await handler(event, data)
+
+    def cleanup(self, max_age: float = MEMORY_ENTRY_MAX_AGE) -> int:
+        now = time.monotonic()
+        stale = [uid for uid, ts in self._last.items() if now - ts > max_age]
+        for uid in stale:
+            self._last.pop(uid, None)
+        return len(stale)
+
+
+message_throttle = ThrottlingMiddleware(rate_limit=0.8)
+callback_throttle = ThrottlingMiddleware(rate_limit=0.5)
 
 
 # ============================================================================
@@ -1038,7 +1135,7 @@ async def add_fav(callback: CallbackQuery) -> None:
     try:
         movie_id = int(callback.data.split("_", 1)[1])
         if not await is_fav(callback.from_user.id, movie_id):
-            (
+            await db(
                 get_sb()
                 .table("favorites")
                 .upsert(
@@ -1047,8 +1144,8 @@ async def add_fav(callback: CallbackQuery) -> None:
                         "movie_id": movie_id,
                     },
                     on_conflict="telegram_id,movie_id",
-                )
-                .execute()
+                ),
+                context="add_fav",
             )
         await callback.message.edit_reply_markup(
             reply_markup=movie_actions_kb(movie_id, True)
@@ -1065,13 +1162,13 @@ async def add_fav(callback: CallbackQuery) -> None:
 async def remove_fav(callback: CallbackQuery) -> None:
     try:
         movie_id = int(callback.data.split("_", 1)[1])
-        (
+        await db(
             get_sb()
             .table("favorites")
             .delete()
             .eq("telegram_id", callback.from_user.id)
-            .eq("movie_id", movie_id)
-            .execute()
+            .eq("movie_id", movie_id),
+            context="remove_fav",
         )
         await callback.message.edit_reply_markup(
             reply_markup=movie_actions_kb(movie_id, False)
@@ -1093,20 +1190,49 @@ async def show_favs(message: Message, bot: Bot) -> None:
         await send_force_subscription(message)
         return
 
+    # MUHIM TUZATISH: avvalgi versiya `.select("movies(*)")` orqali PostgREST'ga
+    # ishonib, favorites -> movies avtomatik "embed" qilinishini kutgan edi.
+    # Supabase'da bu ikki jadval orasida FOREIGN KEY topilmagani uchun
+    # PostgREST har doim "PGRST200 - relationship topilmadi" xatosi bilan
+    # yiqilib tushgan. Endi ikki bosqichli, FK'ga umuman bog'liq bo'lmagan
+    # so'rov ishlatilmoqda - bu har qanday holatda ishlaydi.
     try:
-        # Bitta JOIN so'rov - N+1 muammosiz
-        result = (
+        fav_result = await db(
             get_sb()
             .table("favorites")
-            .select("movies(*)")
+            .select("movie_id")
             .eq("telegram_id", message.from_user.id)
             .order("id", desc=True)
-            .limit(FAV_LIMIT)
-            .execute()
+            .limit(FAV_LIMIT),
+            context="show_favs.favorites",
         )
-        movies = [row["movies"] for row in (result.data or []) if row.get("movies")]
+        movie_ids = [
+            int(row["movie_id"]) for row in (fav_result.data or []) if row.get("movie_id")
+        ]
     except Exception as e:
-        logger.exception("show_favs: %s", e)
+        logger.exception("show_favs (favorites): %s", e)
+        await message.answer(
+            "❌ Sevimlilarni olishda xatolik.", reply_markup=main_menu_kb()
+        )
+        return
+
+    if not movie_ids:
+        await message.answer(
+            "❤️ <b>Sevimlilar</b>\n\nHozircha sevimli kino yo'q.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    try:
+        movies_result = await db(
+            get_sb().table("movies").select("*").in_("id", movie_ids),
+            context="show_favs.movies",
+        )
+        movies_by_id = {int(m["id"]): m for m in (movies_result.data or [])}
+        # eng oxirgi qo'shilgan sevimli birinchi bo'lib qolishi uchun tartib saqlanadi
+        movies = [movies_by_id[mid] for mid in movie_ids if mid in movies_by_id]
+    except Exception as e:
+        logger.exception("show_favs (movies): %s", e)
         await message.answer(
             "❌ Sevimlilarni olishda xatolik.", reply_markup=main_menu_kb()
         )
@@ -1123,7 +1249,7 @@ async def show_favs(message: Message, bot: Bot) -> None:
     for movie in movies:
         text += f"• {safe(movie.get('title'))}\n"
 
-    await message.answer(text, reply_markup=movie_list_kb(movies))
+    await send_long(message, text, reply_markup=movie_list_kb(movies))
 
 
 # ---------- JANRLAR ----------
@@ -1168,27 +1294,23 @@ async def show_genres(message: Message, bot: Bot) -> None:
 async def genre_list(callback: CallbackQuery) -> None:
     try:
         genre_id = int(callback.data.split("_", 1)[1])
-        genre_result = (
-            get_sb()
-            .table("genres")
-            .select("name")
-            .eq("id", genre_id)
-            .limit(1)
-            .execute()
+        genre_result = await db(
+            get_sb().table("genres").select("name").eq("id", genre_id).limit(1),
+            context="genre_list.genre",
         )
         if not genre_result.data:
             await callback.answer("❌ Janr topilmadi.", show_alert=True)
             return
 
         genre = genre_result.data[0]["name"]
-        result = (
+        result = await db(
             get_sb()
             .table("movies")
             .select("*")
             .ilike("genre", f"%{sanitize(genre)}%")
             .order("views", desc=True)
-            .limit(30)
-            .execute()
+            .limit(30),
+            context="genre_list.movies",
         )
         rows = result.data or []
     except Exception as e:
@@ -1220,13 +1342,9 @@ async def popular(message: Message, bot: Bot) -> None:
         return
 
     try:
-        result = (
-            get_sb()
-            .table("movies")
-            .select("*")
-            .order("views", desc=True)
-            .limit(TOP_LIMIT)
-            .execute()
+        result = await db(
+            get_sb().table("movies").select("*").order("views", desc=True).limit(TOP_LIMIT),
+            context="popular",
         )
         rows = result.data or []
     except Exception as e:
@@ -1273,13 +1391,13 @@ async def newest(message: Message, bot: Bot) -> None:
         return
 
     try:
-        result = (
+        result = await db(
             get_sb()
             .table("movies")
             .select("*")
             .order("created_at", desc=True)
-            .limit(NEW_LIMIT)
-            .execute()
+            .limit(NEW_LIMIT),
+            context="newest",
         )
         rows = result.data or []
     except Exception as e:
@@ -1676,17 +1794,22 @@ async def del_yes(callback: CallbackQuery, state: FSMContext) -> None:
         return
     try:
         movie_id = int(callback.data.split("_")[2])
-        # favorites FK cascade bilan avtomatik o'chadi
-        result = (
-            get_sb()
-            .table("movies")
-            .delete()
-            .eq("id", movie_id)
-            .execute()
+        # favorites FK cascade bilan avtomatik o'chadi (agar FK sozlangan bo'lsa)
+        result = await db(
+            get_sb().table("movies").delete().eq("id", movie_id),
+            context="del_yes",
         )
         if not result.data:
             await callback.answer("❌ Kino topilmadi.", show_alert=True)
             return
+        # sevimlilarda qolgan "yetim" yozuvlar bo'lmasligi uchun tozalab qo'yamiz
+        try:
+            await db(
+                get_sb().table("favorites").delete().eq("movie_id", movie_id),
+                context="del_yes.favorites_cleanup",
+            )
+        except Exception as e:
+            logger.warning("del_yes favorites cleanup: %s", e)
         await state.clear()
         await callback.message.edit_text("✅ Kino o'chirildi.")
         await callback.answer("O'chirildi.")
@@ -1710,16 +1833,17 @@ async def admin_list(event: Union[Message, CallbackQuery]) -> None:
     if not is_admin(event.from_user.id):
         return
     try:
-        result = (
+        result = await db(
             get_sb()
             .table("movies")
             .select("id,code,title,channel_id,message_id,views,year,genre,rating")
             .order("id", desc=True)
-            .limit(ADMIN_LIST_LIMIT)
-            .execute()
+            .limit(ADMIN_LIST_LIMIT),
+            context="admin_list",
         )
         rows = result.data or []
-    except Exception:
+    except Exception as e:
+        logger.error("admin_list: %s", e)
         rows = []
 
     if not rows:
@@ -1751,24 +1875,29 @@ async def admin_stats(event: Union[Message, CallbackQuery]) -> None:
     if not is_admin(event.from_user.id):
         return
     try:
-        users_result = (
-            get_sb().table("users").select("id", count="exact").execute()
+        users_result = await db(
+            get_sb().table("users").select("id", count="exact"),
+            context="admin_stats.users",
         )
-        movies_result = (
-            get_sb().table("movies").select("id", count="exact").execute()
+        movies_result = await db(
+            get_sb().table("movies").select("id", count="exact"),
+            context="admin_stats.movies",
         )
-        views_result = get_sb().table("movies").select("views").execute()
+        views_result = await db(
+            get_sb().table("movies").select("views"),
+            context="admin_stats.views",
+        )
         total_views = sum(
             int(x.get("views") or 0) for x in (views_result.data or [])
         )
 
         today = datetime.now(timezone.utc).date().isoformat()
-        today_result = (
+        today_result = await db(
             get_sb()
             .table("users")
             .select("id", count="exact")
-            .gte("last_activity", f"{today}T00:00:00+00:00")
-            .execute()
+            .gte("last_activity", f"{today}T00:00:00+00:00"),
+            context="admin_stats.today",
         )
 
         text = (
@@ -1791,20 +1920,21 @@ async def admin_users(event: Union[Message, CallbackQuery]) -> None:
     if not is_admin(event.from_user.id):
         return
     try:
-        total = get_sb().table("users").select("id", count="exact").execute()
-        blocked = (
-            get_sb()
-            .table("users")
-            .select("id", count="exact")
-            .eq("is_blocked", True)
-            .execute()
+        total = await db(
+            get_sb().table("users").select("id", count="exact"),
+            context="admin_users.total",
+        )
+        blocked = await db(
+            get_sb().table("users").select("id", count="exact").eq("is_blocked", True),
+            context="admin_users.blocked",
         )
         text = (
             "👥 <b>Foydalanuvchilar</b>\n\n"
             f"👤 Jami: <b>{total.count or 0}</b>\n"
             f"🚫 Bloklagan: <b>{blocked.count or 0}</b>"
         )
-    except Exception:
+    except Exception as e:
+        logger.error("admin_users: %s", e)
         text = "❌ Xatolik."
 
     await send_long(event, text)
@@ -1906,13 +2036,9 @@ async def force_add_process(
         username = getattr(chat, "username", None) or ""
         title = getattr(chat, "title", None) or username or str(chat_id)
 
-        existing = (
-            get_sb()
-            .table("force_channels")
-            .select("id")
-            .eq("chat_id", chat_id)
-            .limit(1)
-            .execute()
+        existing = await db(
+            get_sb().table("force_channels").select("id").eq("chat_id", chat_id).limit(1),
+            context="force_add.existing",
         )
 
         payload = {
@@ -1924,19 +2050,19 @@ async def force_add_process(
         }
 
         if existing.data:
-            (
-                get_sb()
-                .table("force_channels")
-                .update(payload)
-                .eq("chat_id", chat_id)
-                .execute()
+            await db(
+                get_sb().table("force_channels").update(payload).eq("chat_id", chat_id),
+                context="force_add.update",
             )
             text = (
                 "♻️ <b>Kanal yangilandi!</b>\n\n"
                 f"📢 {safe(title)}\n🆔 <code>{chat_id}</code>"
             )
         else:
-            get_sb().table("force_channels").insert(payload).execute()
+            await db(
+                get_sb().table("force_channels").insert(payload),
+                context="force_add.insert",
+            )
             text = (
                 "✅ <b>Kanal qo'shildi!</b>\n\n"
                 f"📢 {safe(title)}\n🆔 <code>{chat_id}</code>"
@@ -1990,12 +2116,9 @@ async def force_delete_process(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        result = (
-            get_sb()
-            .table("force_channels")
-            .delete()
-            .eq("chat_id", chat_id)
-            .execute()
+        result = await db(
+            get_sb().table("force_channels").delete().eq("chat_id", chat_id),
+            context="force_delete",
         )
         channel_cache.invalidate("channels")
         await state.clear()
@@ -2060,12 +2183,9 @@ async def broadcast_run(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
 
     try:
-        result = (
-            get_sb()
-            .table("users")
-            .select("telegram_id")
-            .eq("is_blocked", False)
-            .execute()
+        result = await db(
+            get_sb().table("users").select("telegram_id").eq("is_blocked", False),
+            context="broadcast_run.users",
         )
         users = [
             int(x["telegram_id"])
@@ -2216,6 +2336,36 @@ async def error_handler(event: ErrorEvent) -> None:
 
 
 # ============================================================================
+# FON VAZIFALARI (xotirani davriy tozalash)
+# ============================================================================
+
+async def memory_cleanup_task() -> None:
+    """Uzoq muddat ishlayotgan botda xotira sekin-asta o'sib ketmasligi uchun
+    eskirgan in-memory yozuvlarni (faollik/throttling keshlari) davriy tozalaydi."""
+    while True:
+        await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
+        try:
+            now = time.monotonic()
+            stale_users = [
+                uid for uid, ts in _last_activity.items()
+                if now - ts > MEMORY_ENTRY_MAX_AGE
+            ]
+            for uid in stale_users:
+                _last_activity.pop(uid, None)
+
+            cleaned_msg = message_throttle.cleanup()
+            cleaned_cb = callback_throttle.cleanup()
+
+            if stale_users or cleaned_msg or cleaned_cb:
+                logger.info(
+                    "Xotira tozalandi: activity=%s, msg_throttle=%s, cb_throttle=%s",
+                    len(stale_users), cleaned_msg, cleaned_cb,
+                )
+        except Exception as e:
+            logger.warning("memory_cleanup_task: %s", e)
+
+
+# ============================================================================
 # ASOSIY FUNKSIYA
 # ============================================================================
 
@@ -2236,8 +2386,12 @@ async def main() -> None:
         return
 
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase ulandi.")
+        # MUHIM: sinxron create_client() o'rniga ASYNC create_async_client()
+        # ishlatilmoqda - shu orqali bazaga murojaatlar endi asyncio event
+        # loop'ni bloklamaydi va bot ko'p foydalanuvchi/ko'p ma'lumotda ham
+        # yengil va tez javob beradi.
+        supabase = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("Supabase ulandi (async client).")
     except Exception:
         logger.exception("Supabase xatosi")
         return
@@ -2255,8 +2409,12 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Anti-flood middleware (handlerlardan oldin)
-    router.message.middleware(ThrottlingMiddleware(rate_limit=0.8))
+    # Anti-flood middleware (handlerlardan oldin) - endi message VA callback
+    # so'rovlari uchun ham ishlaydi
+    router.message.middleware(message_throttle)
+    router.callback_query.middleware(callback_throttle)
+
+    cleanup_task_handle = asyncio.create_task(memory_cleanup_task())
 
     logger.info("Kino Bot ishga tushdi.")
 
@@ -2267,6 +2425,11 @@ async def main() -> None:
             allowed_updates=dp.resolve_used_update_types(),
         )
     finally:
+        cleanup_task_handle.cancel()
+        try:
+            await cleanup_task_handle
+        except asyncio.CancelledError:
+            pass
         await bot.session.close()
 
 
